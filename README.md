@@ -29,7 +29,7 @@ This repo also hosts the other two Kokkos/CUDA extensions used by the
 | Extension | Imported as | Used by |
 |-----------|-------------|---------|
 | `kokkos_sim` | `import kokkos_sim` | `ksim.KokkosProgramSampler` (this package) |
-| `kokkos_decoder` | `import kokkos_decoder` | `soft-info`'s `decode.sinter` (BP+OSD / Relay-BP / BP+LSD) |
+| `kokkos_decoder` | `import kokkos_decoder` | `soft-info`'s `decode.decoders` (BP+OSD / Relay-BP / BP+LSD) |
 | `kokkos_mcts` | `import kokkos_mcts` | `soft-info`'s `simulations/optimize_schedule.py` (needs MPI) |
 
 The C++ backends are a separate CMake build (needs a Kokkos install). Without
@@ -38,22 +38,10 @@ them, `ksim.compile` and the numpy reference `ksim.sample_flat` still work; only
 `kokkos_sim`. All three `.so` install as top-level modules into `src/python/`,
 so an editable install of this repo exposes them on the importer's path.
 
-```bash
-module load intel/mpi          # kokkos_mcts configures against MPI
-NANOBIND_DIR=$(python -c "import nanobind; print(nanobind.__file__.replace('/__init__.py',''))")
-cmake -S src/cpp -B build \
-  -DKokkos_DIR=<kokkos-install>/lib64/cmake/Kokkos \
-  -DCMAKE_PREFIX_PATH=$NANOBIND_DIR \
-  -DPython_EXECUTABLE="$(which python)" \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-  -DCMAKE_INSTALL_PREFIX="$(pwd)/src/python"
-cmake --build build -j$(nproc)
-cmake --install build          # installs kokkos_{sim,decoder,mcts}.*.so into src/python/
-```
-
-Rebuild all three together, never just one: each statically links Kokkos, so
-mixing `.so` built against different Kokkos installs in one process corrupts the
-shared runtime state (segfault when the second extension is first used).
+CPU and CUDA build recipes: [`docs/build.md`](docs/build.md). Rebuild all three
+together, never just one: each statically links Kokkos, so mixing `.so` built
+against different Kokkos installs in one process corrupts the shared runtime
+state (segfault when the second extension is first used).
 
 ## Use
 
@@ -69,6 +57,18 @@ ks = ksim.KokkosProgramSampler(flat)
 f = ksim.ChannelSampler(channel_probs, error_transform, seed=42).sample(n_shots).astype("uint8")
 out = ks.sample(f, seed=42)    # (B, n_outputs); det = out[:, :flat.num_detectors]
 ```
+
+`example/sample_demo.py` runs this end to end (Clifford checked against stim, a
+non-Clifford T circuit stim cannot touch, and the compile cache across a
+p-sweep).
+
+## Docs
+
+| | |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | The `FlatProgram` contract, the compile and sample halves, the `kokkos_decoder`/`kokkos_mcts` APIs, and the C++ conventions all three extensions share |
+| [`docs/build.md`](docs/build.md) | CPU (OpenMP) and CUDA build recipes, Kokkos reinstall, smoke test |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Non-Clifford sampler deep dive (stim → tsim → kokkos_sim → clifft) and the decoder evolution log (kokkos vs nv-qldpc vs ldpc) |
 
 Portions of the compile side are derived from Apache-2.0 third-party software —
 see [`NOTICE`](NOTICE).
