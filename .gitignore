@@ -1,0 +1,16 @@
+# Build artifacts
+/build/
+*.so
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Environments
+/env/
+/.venv/
+/venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
+.python-version

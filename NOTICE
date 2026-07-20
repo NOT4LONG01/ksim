@@ -1,0 +1,41 @@
+ksim — in-repo ZX stabilizer-rank engine (symbolic compile + sample)
+====================================================================
+
+The compile side of ``ksim`` replaces the ``bloqade-tsim`` package dependency
+for the non-Clifford sampler's symbolic compile. It calls ``pyzx_param``
+directly and emits ``ksim.FlatProgram`` buffers (consumed by the same
+``ksim`` sampler).
+
+Portions of this package are derived from third-party Apache-2.0 software:
+
+1. bloqade-tsim (https://pypi.org/project/bloqade-tsim/), Apache License 2.0.
+   The following modules are vendored from bloqade-tsim, with imports adapted
+   to be self-contained within ksim and (for graph.py / pipeline.py) the JAX
+   dependency removed:
+   (all under src/python/ksim/compile/, i.e. the `ksim.compile` subpackage)
+     - channels.py       <- tsim/noise/channels.py            (verbatim)
+     - instructions.py   <- tsim/core/instructions.py         (imports adapted)
+     - parse.py          <- tsim/core/parse.py                (imports adapted)
+     - stabrank.py       <- tsim/compile/stabrank.py          (verbatim)
+     - graph.py          <- tsim/core/graph.py                (imports adapted;
+                            prepare_graph now takes a stim.Circuit directly)
+     - program_text.py   <- tsim/utils/program_text.py        (verbatim)
+     - _linalg.py        <- tsim/utils/linalg.py:find_basis   (verbatim subset)
+     - types.py          <- tsim/core/types.py:SamplingGraph  (subset)
+     - pipeline.py       <- tsim/compile/{pipeline,compile}.py (derived; the
+                            equinox/JAX CompiledScalarGraphs emission is
+                            replaced by direct numpy -> ksim.FlatProgram)
+
+   (The sample side — ksim/program.py and ksim/sample/{evaluate,exact_scalar,
+   sampler}.py — is a numpy/Kokkos reimplementation of tsim's evaluator,
+   predating this port.)
+
+2. pyzx_param (https://pypi.org/project/pyzx_param/), Apache License 2.0.
+   The stabilizer-rank cat5 magic-state decomposition (the "hard core" of the
+   compile) is pyzx_param's; ksim.stabrank.find_stab only orchestrates the
+   recursion around pyzx_param's `simulate.replace_magic_states` /
+   `replace_u3_states`.
+
+A copy of the Apache License 2.0 governing the vendored portions is available
+at https://www.apache.org/licenses/LICENSE-2.0 and in the upstream packages'
+distributions.
