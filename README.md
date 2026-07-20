@@ -21,11 +21,25 @@ reference. One engine for Clifford and non-Clifford circuits alike.
 pip install -e .               # Python layer (numpy, stim, pyzx_param)
 ```
 
-The `kokkos_sim` C++ backend is a separate CMake build (needs a Kokkos install).
-Without it, `ksim.compile` and the numpy reference `ksim.sample_flat` still work;
-only `KokkosProgramSampler` (and `sample_circuit(..., backend="gpu")`) require it.
+This repo also hosts the other two Kokkos/CUDA extensions used by the
+`soft-info-code-switch` QEC pipeline — they share the same Kokkos build and
+`src/cpp/` tree, so they live together here while their Python glue stays in
+`soft-info-code-switch`:
+
+| Extension | Imported as | Used by |
+|-----------|-------------|---------|
+| `kokkos_sim` | `import kokkos_sim` | `ksim.KokkosProgramSampler` (this package) |
+| `kokkos_decoder` | `import kokkos_decoder` | `soft-info`'s `decode.sinter` (BP+OSD / Relay-BP / BP+LSD) |
+| `kokkos_mcts` | `import kokkos_mcts` | `soft-info`'s `simulations/optimize_schedule.py` (needs MPI) |
+
+The C++ backends are a separate CMake build (needs a Kokkos install). Without
+them, `ksim.compile` and the numpy reference `ksim.sample_flat` still work; only
+`KokkosProgramSampler` (and `sample_circuit(..., backend="gpu")`) require
+`kokkos_sim`. All three `.so` install as top-level modules into `src/python/`,
+so an editable install of this repo exposes them on the importer's path.
 
 ```bash
+module load intel/mpi          # kokkos_mcts configures against MPI
 NANOBIND_DIR=$(python -c "import nanobind; print(nanobind.__file__.replace('/__init__.py',''))")
 cmake -S src/cpp -B build \
   -DKokkos_DIR=<kokkos-install>/lib64/cmake/Kokkos \
@@ -34,8 +48,12 @@ cmake -S src/cpp -B build \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DCMAKE_INSTALL_PREFIX="$(pwd)/src/python"
 cmake --build build -j$(nproc)
-cmake --install build          # installs kokkos_sim.*.so into src/python/
+cmake --install build          # installs kokkos_{sim,decoder,mcts}.*.so into src/python/
 ```
+
+Rebuild all three together, never just one: each statically links Kokkos, so
+mixing `.so` built against different Kokkos installs in one process corrupts the
+shared runtime state (segfault when the second extension is first used).
 
 ## Use
 
