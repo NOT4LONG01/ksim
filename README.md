@@ -51,8 +51,6 @@ kokkos_sim and tsim run the same ZX stabilizer-rank sum, so both are exact — t
 |---|---|
 | ![Amplitude deviation vs float64 reference](example/figure/distillation_precision.png) | ![Distillation pipeline profile](example/figure/distillation_profile.png) |
 
-A closely related GPU non-Clifford simulator, [SOFT](https://arxiv.org/abs/2512.23037) (generalized stabilizer tableau), reports 6.68 µs/shot at d=3 and 93.7 µs/shot at d=5 magic-state cultivation on an H800 — the d=5 circuit (42 qubits) is out of statevector range entirely. These are cited from the paper, not re-run here (the dev cluster is CPU-only); a same-GPU kokkos_sim-vs-SOFT number is future work. Details in [`docs/benchmarks.md`](docs/benchmarks.md).
-
 **Decoders** — `kokkos_decoder` matches the reference decoders' accuracy and is the fastest in the comparison (LER at p=0.01; decode µs/shot, total excl. sampling):
 
 | code | best LER | kokkos:bp_osd | nv:bp_osd | ldpc:bp_osd |
@@ -110,6 +108,9 @@ ks = ksim.KokkosProgramSampler(flat)
 f = ksim.ChannelSampler(channel_probs, error_transform, seed=42).sample(n_shots).astype("uint8")
 out = ks.sample(f, seed=42)    # (B, n_outputs); det = out[:, :flat.num_detectors]
 ```
+
+Repeated compiles of the same circuit *shape* hit the process-wide
+`ksim.compile_cache` automatically; pass `cache=None` to opt out.
 
 `example/sample_demo.py` runs this end to end (Clifford checked against stim, a
 non-Clifford T circuit stim cannot touch, and the compile cache across a

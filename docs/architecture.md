@@ -83,27 +83,7 @@ construction — numpy float64 lands at ~1e-16, `kokkos_sim` is int64-exact unti
 one final float64 conversion (~1e-16), while a complex64 float-tensor substrate
 lands at ~1e-8. See [`benchmarks.md`](benchmarks.md) Part 1.
 
-### Use
-
-```python
-import ksim
-
-# one call: compile → draw noise → sample → (det, obs)
-det, obs = ksim.sample_circuit(stim_text, n_shots, seed=42, backend="auto")  # or "gpu"/"cpu"
-
-# or the explicit pieces (e.g. to reuse the compiled program):
-flat, channel_probs, error_transform = ksim.compile(stim_text, sample_detectors=True)
-ks = ksim.KokkosProgramSampler(flat)       # GPU; or ksim.sample_flat(flat, f, rng) on CPU
-f = ksim.ChannelSampler(channel_probs, error_transform,
-                        seed=42).sample(n_shots).astype("uint8")   # noise bits, CPU
-out = ks.sample(f, seed=42)                # (B, n_outputs); det = out[:, :flat.num_detectors]
-```
-
-Repeated compiles of the same circuit *shape* hit the process-wide
-`ksim.compile_cache` automatically; pass `cache=None` to opt out.
-
-`example/sample_demo.py` runs the whole path on a plain stim circuit, GPU if
-`kokkos_sim` is built and the numpy reference otherwise.
+Usage example: [`README.md`](../README.md#use).
 
 ---
 
@@ -114,6 +94,106 @@ The sampling backend behind `KokkosProgramSampler`: CUDA on GPU builds, OpenMP
 on CPU-only builds. `zx_eval.hpp` carries the ZX-calculus math (the mirror of
 `sample/evaluate.py`), `kokkos_sim.cpp` the Kokkos runtime and the nanobind
 bindings. Callers reach it through `ksim`, not directly.
+
+### Theoretical grounding: the stabilizer-rank sum
+
+`kokkos_sim` and `tsim` ([QuEraComputing/tsim](https://github.com/QuEraComputing/tsim))
+run the *same* algorithm: the circuit (composed with its adjoint) becomes a
+**ZX-calculus diagram**, reduced by `pyzx`/`pyzx_param` rewrite rules. T gates
+survive this translation as π/4 phase spiders. The reduced diagram is then
+split by **stabilizer-rank decomposition**: each magic (π/4) spider group is
+recursively replaced by a sum of stabilizer terms (≈2^{αt} terms for t
+T-gates, α<1 with the cat-state strategies). Each output probability becomes
+an exact closed-form sum over those terms — four symbolic "term families" per
+term, with coefficients in the ring **ℤ[ω], ω = e^{iπ/4}** (integers
+a+bω+ci+dω̄ scaled by powers of 2). Sampling is autoregressive:
+P(bit_i = 1 | previous bits) = |amplitude with bit i plugged|/|previous
+marginal|, one Bernoulli draw per output. Hardness is paid where it belongs —
+exponentially in T-count, polynomially in everything else.
+
+The two runtimes diverge only in *how* they evaluate that shared sum:
+
+```
+            symbolic (once per circuit, Python)                numeric (per shot)
+ ┌────────────────────────────────────────────────────┐   ┌─────────────────────────┐
+ | circuit             →   ZX diagram   →    stabilizer- |   |  autoregressive loop:   |
+ |      (T†/T gates)       (pyzx reduce)    rank sum   | → |  P(bit=1 | prev bits) = |
+ |                                          Σᵢ cᵢ·|sᵢ⟩  |   |  |amp(bit=1)|²/|prev|²  |
+ |  T survives as π/4      magic spiders → ≈2^(αt)     |   |  one Bernoulli per bit  |
+ |  phase spider           stabilizer terms, cᵢ ∈ ℤ[ω]  |   |                         |
+ └────────────────────────────────────────────────────┘   └─────────────────────────┘
+        identical for tsim and kokkos_sim                   tsim: JAX dispatch per
+                                                            step, cᵢ in complex64
+                                                            kokkos_sim: one fused
+                                                            kernel, cᵢ in int64
+```
+
+### How the Kokkos translation works
+
+The pipeline splits at a natural seam: everything **symbolic** is one-time
+work per circuit, everything **numeric** repeats per shot.
+
+| | stays in Python (`ksim`/`pyzx_param`) | moves to Kokkos (`kokkos_sim`) |
+|---|---|---|
+| ZX graph build + reduction | ✓ | |
+| stabilizer-rank decomposition | ✓ | |
+| term-family compilation | ✓ | |
+| amplitude evaluation | (CPU numpy reference) | fused CUDA kernel |
+| autoregressive sampling loop | (CPU numpy reference) | same kernel, per-shot |
+
+`ksim.compile()` emits the flat numpy `FlatProgram` buffers directly
+(bitmasks, phases, ℤ[ω] prefactors). `kokkos_sim.Component` uploads them
+once; a single kernel launch then runs the *whole* autoregressive loop for a
+batch — each GPU thread owns one shot, computes parities by walking the
+bitmasks, multiplies ℤ[ω] coefficients in int64 with power-of-2
+renormalisation, and draws output bits from its own RNG. The parameter
+vector [error bits | sampled bits | trying bit] is never materialised; bits
+are looked up on the fly. This removes the per-step JAX dispatch that tsim
+pays on every shot.
+
+### Why kokkos_sim wins on precision *and* speed — no trade-off involved
+
+Everything left of the arrow above is shared: both runtimes evaluate the
+*same exact* closed-form sum with the same terms and the same ℤ[ω]
+coefficients. After compile there is no inherent floating-point math in this
+algorithm at all — evaluating a term is GF(2) parity walks over bitmasks
+plus exact integer ℤ[ω] multiplies. Both of tsim's costs are therefore
+artifacts of its runtime substrate, not of the algorithm:
+
+- it stores the exact integers in complex64 **because XLA wants float
+  tensors**, rounding numbers that are exactly representable in int64;
+- it drives the per-bit autoregressive loop from Python through JAX
+  dispatch **because XLA wants whole-array ops**, wrapping trivial math in
+  dispatch overhead.
+
+kokkos_sim removes the substrate instead of optimizing within it: int64
+ℤ[ω] coefficients with power-of-2 renormalisation (exact until one final
+float64 conversion), and the whole loop fused into one CUDA kernel with a
+thread per shot. Precision and speed improve together because neither was
+being traded against the other — both were being paid to the same
+middleman. Measured numbers: [`benchmarks.md`](benchmarks.md) Part 1.
+
+### Precision design: why the arithmetic stays exact
+
+- **The stabilizer-rank sum is exact** — unlike Pauli-propagation or
+  tensor-network truncation there is no controllable-error knob; the only
+  approximation anywhere is float rounding at the very end. (Exception:
+  phases with denominators outside {1,2,4} fold into an "approximate
+  floatfactor"; both runtimes inherit the same float32 constants there.)
+- **The autoregressive recurrence `prev ← prev − p1` is the conditioning
+  hazard**: when a conditional probability approaches 0, subtractive
+  cancellation amplifies relative error. tsim monitors this (warns when the
+  marginal norm deviates from 1 by >1e-5, fails near 1); the int64/float64
+  Kokkos path pushes the cancellation floor far lower than a float32
+  substrate can reach.
+- **Coefficient growth is bounded** by the per-multiply renormalisation
+  (divide by 2 whenever all four ℤ[ω] coefficients are even, tracking the
+  exponent separately) — the same scheme as tsim, but int64 headroom (2⁶³)
+  versus the ~2²⁴ exact-integer ceiling of float32 means deep products
+  cannot silently lose low bits.
+
+Measured amplitude deviations and the validation gates that check them:
+[`benchmarks.md`](benchmarks.md) Part 1.
 
 ---
 

@@ -6,7 +6,7 @@ All numbers: NVIDIA A100-SXM4-80GB. Figures are pre-generated in
 **Contents**
 - [Sampler validation — every backend must match stim](#validation)
 - [Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft](#part-1)
-- [Part 2 — Decoder evolution log: kokkos vs. nv-qldpc vs. ldpc](#part-2)
+- [Part 2 — Decoders: kokkos_decoder vs. nv-qldpc vs. ldpc](#part-2)
 
 The full-pipeline profiles of the QEC runs that *consume* these backends live
 with the consumer: `docs/benchmarks.md` in `soft-info-code-switch`.
@@ -76,33 +76,6 @@ Decision guide — which sampler to use:
 | Non-Clifford, many T-gates (t ≥ 15) | kokkos_sim | χ ≈ 2^{0.228t} beats 2^k at scale; GPU |
 | Rare-event LER (no millions of shots) | clifft | `sample_k()` importance sampling — unique |
 
-### External comparison: SOFT (generalized stabilizer tableau)
-
-[SOFT](https://arxiv.org/abs/2512.23037) (Li et al., 2025) is a closely related
-GPU non-Clifford simulator built on the *generalized stabilizer tableau*, a
-different stabilizer-decomposition route than the ZX stabilizer-rank sum here.
-Its representation cost is a coset bound `|v| ≤ 2^{|Q|−r_Z}` (nonzero tableau
-coefficients) — 16 for the d=3 magic-state-cultivation (MSC) circuit, 1024 for
-d=5 — rather than χ ≈ 2^{0.228t}. It reached the first ground-truth d=5 MSC
-simulation (42 qubits, 72 T/T†): >200 billion shots on 16 NVIDIA H800 GPUs over
-~20 days, showing the protocol's true logical error rate sits ~7.7–7.9× above
-the earlier Clifford-proxy estimates.
-
-The numbers below are **reported in that paper** (single H800, double precision),
-not re-run here — the dev cluster is CPU-only, and SOFT is GPU-only. The one
-overlapping circuit is d=3 cultivation:
-
-| circuit | SOFT (H800) | clifft (CPU AVX2) | note |
-|---|---|---|---|
-| MSC cultivation d=3 (peak_rank 4 / \|v\|≤16) | 6.68 µs/shot | 2.8 µs/shot | tiny active dimension — CPU wins, no launch overhead |
-| MSC cultivation d=5 (42 q, \|v\|≤1024) | 93.7 µs/shot | out of range | statevector/clifft cannot hold 42 qubits |
-
-SOFT's own baselines were CPU stabilizer-decomposition tools (Qiskit
-extended-stabilizer, stabilizer tensor network), which it beats by >10⁴×; it did
-not compare against stim/tsim/clifft/ksim. A fair kokkos_sim-vs-SOFT number on
-the same H800 would need running both on one GPU — noted here as future work, not
-claimed.
-
 ### Theoretical ground
 
 **stim** rests on the Gottesman–Knill theorem: a state reachable from |0…0⟩
@@ -113,7 +86,7 @@ floating point** in the sampling path. The price: T gates cannot be
 expressed at all (a T conjugates a Pauli into a non-Pauli operator and the
 tableau has nowhere to put it). An earlier in-repo GPU sampler implemented
 exactly this formalism (since removed); the current `kokkos_sim` uses the
-stabilizer-rank representation below instead, so T gates are first-class.
+stabilizer-rank representation instead, so T gates are first-class.
 
 **tsim** changes the representation entirely: the circuit (composed with its
 adjoint) becomes a **ZX-calculus diagram**, reduced by `pyzx` rewrite rules.
@@ -128,35 +101,24 @@ P(bit_i = 1 | previous bits) = |amplitude with bit i plugged|/|previous
 marginal|, one Bernoulli draw per output. Hardness is paid where it
 belongs — exponentially in T-count, polynomially in everything else.
 
+**clifft** takes a third route: a **Schrodinger-VM**, not a stabilizer-rank
+sum at all. Clifford gates are absorbed offline into a Stim tableau frame at
+zero runtime cost; what's left is a dense complex statevector over only the
+`k` qubits currently in non-Clifford superposition — `k` grows with T-gates
+and shrinks again as syndrome measurements collapse the active subspace, so
+for QEC circuits `k_max` can stay small even as total qubit count grows.
+Per-shot cost is O(2^k) against the stabilizer-rank sum's O(χ), χ ≈
+2^{0.228t} — a different exponential, in the *active dimension* rather than
+the *T-count*, which is why clifft wins when k stays small and loses when it
+doesn't. It also does exact arithmetic in float64 rather than ℤ[ω], so unlike
+tsim it has no complex64-rounding penalty to pay.
+
 (The symbolic-compile half is the in-repo `ksim.compile` — `pyzx_param` directly,
-no `bloqade-tsim`; `kokkos_sim`'s numeric half below is independent of it.)
+no `bloqade-tsim`; `kokkos_sim`'s numeric half is independent of it. How the
+Kokkos translation works and why it wins on precision and speed:
+[`docs/architecture.md`](architecture.md) `kokkos_sim` section.)
 
-### How the Kokkos translation works
-
-The pipeline splits at a natural seam: everything **symbolic** is one-time
-work per circuit, everything **numeric** repeats per shot.
-
-| | stays in Python (`ksim`/`pyzx_param`) | moves to Kokkos (`kokkos_sim`) |
-|---|---|---|
-| ZX graph build + reduction | ✓ | |
-| stabilizer-rank decomposition | ✓ | |
-| term-family compilation | ✓ | |
-| amplitude evaluation | (CPU numpy reference) | fused CUDA kernel |
-| autoregressive sampling loop | (CPU numpy reference) | same kernel, per-shot |
-
-`ksim.compile()` emits the flat numpy `FlatProgram`
-buffers directly (bitmasks, phases, ℤ[ω] prefactors). `kokkos_sim.Component`
-uploads them once; a single kernel launch then runs the *whole*
-autoregressive loop for a batch — each GPU thread owns one shot, computes
-parities by walking the bitmasks, multiplies ℤ[ω] coefficients in int64
-with power-of-2 renormalisation, and draws output bits from its own RNG.
-The parameter vector [error bits | sampled bits | trying bit] is never
-materialised; bits are looked up on the fly. This removes the per-step JAX
-dispatch entirely: tsim spends ~500 µs/shot on the distillation workloads
-below, the Kokkos runtime 1.0–1.6 µs/shot after compile. See
-[`docs/architecture.md`](architecture.md) (`ksim` section) for the `ksim` package's architecture.
-
-### The process, end to end
+### The workload
 
 The benchmark is the tsim repo's own flagship demo workload:
 [QuEraComputing/tsim](https://github.com/QuEraComputing/tsim) 5→1
@@ -166,44 +128,6 @@ The logical circuit (unencoded view, rendered with tsim's stim-style
 `diagram("timeline-svg")`):
 
 ![Logical 5→1 distillation circuit](../example/figure/distillation_circuit.svg)
-
-```
-            symbolic (once per circuit, Python)                numeric (per shot)
- ┌────────────────────────────────────────────────────┐   ┌─────────────────────────┐
- | circuit (above)   →   ZX diagram   →    stabilizer- |   |  autoregressive loop:   |
- |      (T†/T gates)       (pyzx reduce)    rank sum   | → |  P(bit=1 | prev bits) = |
- |                                          Σᵢ cᵢ·|sᵢ⟩  |   |  |amp(bit=1)|²/|prev|²  |
- |  T survives as π/4      magic spiders → ≈2^(αt)     |   |  one Bernoulli per bit  |
- |  phase spider           stabilizer terms, cᵢ ∈ ℤ[ω]  |   |                         |
- └────────────────────────────────────────────────────┘   └─────────────────────────┘
-        identical for tsim and kokkos_sim                   tsim: JAX dispatch per
-                                                            step, cᵢ in complex64
-                                                            kokkos_sim: one fused
-                                                            kernel, cᵢ in int64
-```
-
-### Why kokkos_sim wins on precision *and* speed — no trade-off involved
-
-Everything left of the arrow is shared: both runtimes evaluate the *same
-exact* closed-form sum with the same terms and the same ℤ[ω] coefficients.
-After compile there is no inherent floating-point math in this algorithm at
-all — evaluating a term is GF(2) parity walks over bitmasks plus exact
-integer ℤ[ω] multiplies. Both of tsim's costs are therefore artifacts of
-its runtime substrate, not of the algorithm:
-
-- it stores the exact integers in complex64 **because XLA wants float
-  tensors** → 2.7×10⁻⁸ amplitude error from rounding numbers that are
-  exactly representable in int64;
-- it drives the per-bit autoregressive loop from Python through JAX
-  dispatch **because XLA wants whole-array ops** → ~500 µs/shot of
-  dispatch overhead wrapped around trivial math.
-
-kokkos_sim removes the substrate instead of optimizing within it: int64
-ℤ[ω] coefficients with power-of-2 renormalisation (exact until one final
-float64 conversion → 1.1×10⁻¹⁶), and the whole loop fused into one CUDA
-kernel with a thread per shot (1.0–1.6 µs/shot). Precision and speed
-improve together because neither was being traded against the other —
-both were being paid to the same middleman.
 
 ### Measured comparison
 
@@ -267,35 +191,20 @@ both were being paid to the same middleman.
 
 Error sources, ranked by size:
 
-| Source | stim | tsim (JAX) | kokkos_sim |
-|---|---|---|---|
-| Monte-Carlo shot noise | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) |
-| decomposition truncation | n/a | **0** (exact, not approximate) | **0** |
-| term arithmetic | exact (GF(2) bits) | exact ℤ[ω], but carried in float32 | exact ℤ[ω] in int64 |
-| complex conversion | n/a | complex64 → ~1e-7 rel. | float64 → ~1e-16 rel. |
-| measured amplitude deviation* | — | 2.7 × 10⁻⁸ | 1.1 × 10⁻¹⁶ |
+| Source | stim | tsim (JAX) | kokkos_sim | clifft |
+|---|---|---|---|---|
+| Monte-Carlo shot noise | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) |
+| decomposition truncation | n/a | **0** (exact, not approximate) | **0** | n/a (dense statevector, no decomposition) |
+| term/state arithmetic | exact (GF(2) bits) | exact ℤ[ω], but carried in float32 | exact ℤ[ω] in int64 | complex128 statevector |
+| complex conversion | n/a | complex64 → ~1e-7 rel. | float64 → ~1e-16 rel. | float64 → ~1e-16 rel. |
+| measured amplitude deviation* | — | 2.7 × 10⁻⁸ | 1.1 × 10⁻¹⁶ | ~1×10⁻¹⁵ (expected, not directly measured) |
 
 \*max |amplitude − float64 reference| across all compiled graphs of the
-distillation workloads.
-
-Three structural points:
-
-- **The stabilizer-rank sum is exact** — unlike Pauli-propagation or
-  tensor-network truncation there is no controllable-error knob; the only
-  approximation anywhere is float rounding at the very end. (Exception:
-  phases with denominators outside {1,2,4} fold into an "approximate
-  floatfactor"; both runtimes inherit the same float32 constants there.)
-- **The autoregressive recurrence `prev ← prev − p1` is the conditioning
-  hazard**: when a conditional probability approaches 0, subtractive
-  cancellation amplifies relative error. tsim monitors this (warns when the
-  marginal norm deviates from 1 by >1e-5, fails near 1); in float32 that
-  guard fires ~1e-7 from genuine underflow, while the int64/float64 Kokkos
-  path pushes the cancellation floor down to ~1e-16 — nine orders of margin.
-- **Coefficient growth is bounded** by the per-multiply renormalisation
-  (divide by 2 whenever all four ℤ[ω] coefficients are even, tracking the
-  exponent separately) — the same scheme as tsim, but int64 headroom (2⁶³)
-  versus the ~2²⁴ exact-integer ceiling of float32 means deep products
-  cannot silently lose low bits.
+distillation workloads; clifft's row is the expected float64 rounding floor,
+not a value measured the same way (no shared reference graph to diff against
+— it never builds a ZX/stabilizer-rank graph at all). Why the arithmetic
+stays exact and where the error floor comes from:
+[`docs/architecture.md`](architecture.md) `kokkos_sim` section.
 
 Validation gates (all passing): per-graph |amplitude| vs the NumPy float64
 reference; exact single-T and double-T statistics (H·T·H → 0.1454 vs exact
@@ -303,13 +212,12 @@ reference; exact single-T and double-T statistics (H·T·H → 0.1454 vs exact
 0.073 and 0.146); Clifford circuits with noise channels against stim
 (`tests/test_comparison.py`).
 
-### clifft — Schrodinger-VM baseline (CPU, active-dimension statevector)
+### clifft — the Schrodinger-VM sampler in depth
 
 clifft (Unitary Foundation, [github.com/unitaryfoundation/clifft](https://github.com/unitaryfoundation/clifft))
-is an exact near-Clifford simulator with a fundamentally different algorithm
-from tsim/kokkos_sim. Where the stabilizer-rank approach expresses the full
-circuit amplitude as a *sum* of χ stabilizer terms, clifft maintains a *dense
-statevector* over the `k` qubits currently in superposition:
+is the fourth sampler alongside stim, tsim, and kokkos_sim — see
+[Theoretical ground](#theoretical-ground) for how its factored-statevector
+algorithm compares to the stabilizer-rank sum the other two run. In full:
 
 ```
   |ψ⟩ = γ · U_C · P · ( |φ⟩_A ⊗ |0⟩_D )
@@ -419,18 +327,18 @@ for rare-event LER estimation — a capability neither stim nor ksim offer today
 ---
 
 <a name="part-2"></a>
-## Part 2 — Decoder evolution log: kokkos vs. nv-qldpc vs. ldpc
+## Part 2 — Decoders: kokkos_decoder vs. nv-qldpc vs. ldpc
 
-Status log of how `kokkos_decoder` (BP+OSD-0, Relay-BP, BP+LSD) caught up to
-— and passed — the external baselines: NVIDIA `nv-qldpc-decoder` (cudaq-qec)
-and Roffe's `ldpc` package. All numbers: A100-SXM4-80GB, depolarizing
-p = 0.01, GPU batch 512, BP max_iter 30, OSD-0.
+How `kokkos_decoder` (BP+OSD-0, Relay-BP, BP+LSD) stands against the external
+baselines: NVIDIA `nv-qldpc-decoder` (cudaq-qec) and Roffe's `ldpc` package.
+All numbers: A100-SXM4-80GB, depolarizing p = 0.01, GPU batch 512, BP
+max_iter 30, OSD-0.
 
 ### Runtime architecture: where each microsecond lives
 
 Every per-shot cost in the profile figures belongs to one of three
-infrastructure layers. Keeping them straight is what made the decoder fixes
-findable, so the taxonomy first:
+infrastructure layers; keeping them straight is what makes a regression
+findable:
 
 ```
 Python (sinter / benchmark driver)
@@ -456,9 +364,10 @@ Gauss–Jordan). Two Kokkos-specific facts drove the whole performance story:
 1. *Atomics are native only for 32/64-bit types.* `atomic_fetch_xor` on a
    `uint8_t` view goes through desul's CAS/lock emulation. On high-row-
    weight codes (~57 edges/row, 4 rows per 32-bit word → ~230-way
-   contention) that emulation cost ~83 ms **per BP iteration**. The same
-   op on `unsigned int` is a single hardware `atomicXor` — that one type
-   change is the 145–200× speedup between the Jun-11 and Jun-12 profiles.
+   contention) that emulation costs ~83 ms **per BP iteration** — a
+   145–200× regression versus the native `unsigned int` `atomicXor` the
+   convergence check now uses. Row-parity fields must stay 32/64-bit for
+   this reason.
 2. *Kernel launches are the fixed cost, not the math.* One BP iteration
    is ~10 small kernels; 30 iterations launch ~300 kernels whether the
    batch holds 1 shot or 512. Async `deep_copy(exec, …)` and a host-
@@ -516,56 +425,13 @@ benchmark must pick shot counts as exact multiples of the batch size — whereas
 the kokkos modules accept any ragged final batch for free because
 workspaces are subviewed to the call's B.
 
-### Phase 0 — original GPU BP+OSD (state at `a1a2696`)
-
-Product-sum BP + dense uint8 Gauss–Jordan OSD-0, columns sorted by
-**|LLR| descending**. Two latent problems, one per layer:
-
-1. *Algorithmic (device code):* the OSD column order was wrong for this
-   OSD formulation — most-reliable first instead of most-likely-error
-   first (Roffe) → far from ldpc/nv accuracy wherever OSD decided the
-   outcome (tet n=15 LER 0.40 vs ldpc 0.054).
-2. *Kokkos atomics:* the per-iteration convergence check did
-   `atomic_fetch_xor` on a **uint8** view → desul CAS/lock emulation
-   under ~230-way contention → BP itself ~83 ms/iteration. The Jun-11
-   profile recorded 23 000–50 000 µs/shot decode on the color codes,
-   ~2 500× nv.
-
-Jun-11 snapshot (LER @ 2048 shots / decode µs/shot):
-
-| code | kokkos:bp_osd | nv:bp_osd | ldpc:bp_osd |
-|---|---|---|---|
-| surface d=5 | 0.121 / 3 235 | 0.059 / 12 | 0.023 / 1 543 |
-| tri n=19 | 0.434 / 50 400 | 0.380 / 21 | 0.207 / 10 488 |
-| tet n=15 | 0.401 / 23 861 | 0.149 / 16 | 0.054 / 8 628 |
-
-### Phase 1 — OSD-0 rewrite (Jun 11)
-
-Bit-packed (uint64) team-parallel Gauss–Jordan, bitonic sort by **signed
-LLR ascending**, one CUDA block per non-converged shot. Predictions became
-*bit-identical* to `ldpc.BpOsdDecoder` (product_sum, OSD-0) on every tested
-code — accuracy parity with the reference implementation. Speed still
-terrible (problem 2 unsolved).
-
-### Phase 2 — the uint8-atomic fix (Jun 12)
-
-`row_par` switched to `unsigned int` (native `atomicXor`) in `bp_osd.cpp` /
-`relay_bp.cpp` / `common.{hpp,cpp}`. Four-line change, 145–200× end-to-end.
-Diagnosed *without a profiler* (ncu has no counter permissions in this
-container, nvprof refuses SM80, nsys absent) by pure parameter sweeps from
-Python: zero-syndrome decodes separate BP from OSD (BP converges at
-iteration 0, OSD never runs); a max_iter sweep gave a clean ~83 ms/iteration
-slope scaling with batch size → compute, not launch overhead → the only
-non-native operation in the iteration loop was the sub-word atomic.
-
-The result is the current profile pair — same axes, same stages, read side
-by side:
+### Reading the pipeline profiles
 
 ![Pipeline profile, kokkos:bp_osd](../example/figure/pipeline_profile_kokkos_bp_osd.png)
 
 ![Pipeline profile, nv:bp_osd](../example/figure/pipeline_profile_nv_bp_osd.png)
 
-How to read them through the layer taxonomy:
+Same axes, same stages, read side by side, through the layer taxonomy above:
 
 - **kokkos:bp_osd** (stim bars: 4 / 11 / 6 / 35 / 27 µs/shot total): on
   small codes the bar is mostly *decode_overhead* (orange) — the fixed
@@ -582,55 +448,37 @@ How to read them through the layer taxonomy:
   fixed cost, but every shot pays full price; tsim-sampled bars are the
   only ones where sampling rivals decoding.
 
-### Phase 3 — fair nv baseline (Jun 12)
+nv-qldpc requires explicit `use_osd=True` — without it, `osd_method`/
+`osd_order` are silently ignored and the decoder returns thresholded BP
+marginals instead (outputs satisfy the syndrome on only 10–70% of shots).
+With OSD actually enabled, nv's LER matches kokkos/ldpc, which is the
+configuration all numbers below use.
 
-The nv-qldpc decoder was misconfigured everywhere: without explicit
-`use_osd=True` it silently ignores `osd_method`/`osd_order` and returns
-thresholded BP marginals (outputs satisfied the syndrome on only 10–70 %
-of shots). Fixed in `decode/sinter.py` (`use_osd = osd_method > 0`) and
-both sites in the benchmark driver. With OSD actually on, nv's LER matches
-kokkos/ldpc exactly — the proper bar to clear, and the Jun-11 "kokkos
-less accurate than nv" *and* "nv less accurate than ldpc" readings were
-both artifacts.
+### Relay-BP: disordered-memory scheme and leg tuning
 
-### Phase 4 — Relay-BP upgrade (Jun 12)
+kokkos's Relay-BP uses the Relay-BP paper's **disordered memory**: a
+per-(shot, variable) γ ~ U[γ_min, γ_max], re-drawn each leg and applied as a
+prior↔posterior blend (`prior_eff = (1−γ)·λ + γ·M_prev`), with posteriors
+relayed across legs. The γ field is generated *on device* each leg by a
+stateless splitmix64 hash of (seed, leg, shot, variable) — no RNG state, no
+host↔device traffic, just one (B × nb) fill per leg.
 
-Old kokkos relay: one scalar γ per leg shared by all variables and shots,
-applied as message momentum (`v2c += γ·v2c_old`). Replaced with the
-Relay-BP paper's **disordered memory**: per-(shot, variable)
-γ ~ U[γ_min, γ_max] re-drawn each leg, applied as prior↔posterior blend
-(`prior_eff = (1−γ)·λ + γ·M_prev`), posteriors relayed across legs.
-
-Kokkos detail: the γ field is generated *on device* each leg by a stateless
-splitmix64 hash of (seed, leg, shot, variable) — no RNG state, no
-host↔device traffic, no extra kernel-launch pressure beyond one (B × nb)
-fill per leg. Workspace shrank: a B×nb posterior memory (`tlr_old`)
-replaced the B×E message copy (`v2c_old`).
-
-| code | relay before | relay after | nv:relay_bp |
-|---|---|---|---|
-| tet n=15 (8192 shots) | 0.0291 | **0.0146** | 0.0144 |
-| tri n=19 | 0.1992 | **0.1885** | 0.1958 |
-| surface d=5 | 0.0283 | 0.0366 | 0.0308 |
-
-(Both relays trail plain BP+OSD on the surface code — a property of the
-γ-distribution config, mirrored by nv.)
-
-**Leg-length tuning (same day):** sweeping `leg_max_iter` revealed that
-short legs with frequent γ re-draws dominate long legs on *both* axes — the
-disorder re-randomisation, not the per-leg BP depth, is what escapes
-trapping sets. At pre=10, legs=10 (8192 shots):
+`leg_max_iter=8` is the adopted default: short legs with frequent γ
+re-draws beat long legs on both LER and speed, because the disorder
+re-randomisation — not per-leg BP depth — is what escapes trapping sets.
+At pre=10, legs=10 (8192 shots):
 
 | leg_max_iter | tet n=15 LER / µs·shot⁻¹ | tri n=19 LER / µs·shot⁻¹ |
 |---|---|---|
-| 30 (paper-ish) | 0.0146 / 207 | 0.1885 / 241 |
+| 30 (paper default) | 0.0146 / 207 | 0.1885 / 241 |
 | 8 (adopted) | **0.0110 / 67** | 0.1819 / 78 |
 | 4 (legs=20) | 0.0105 / 68 | 0.1754 / 79 |
 
-`RELAY_ITER = 8` is now the benchmark default. With it, kokkos:relay_bp
-beats nv:relay_bp on accuracy *and* matches or beats it on speed.
+With it, kokkos:relay_bp beats nv:relay_bp on accuracy and matches or beats
+it on speed (both relays trail plain BP+OSD on the surface code — a
+property of the γ-distribution config, mirrored by nv).
 
-### Current standings (Jun 12, refreshed data)
+### Current standings
 
 **LER, p = 0.01** (2 000 shots; p-sweep rows 30 000 shots for d=3):
 
@@ -661,7 +509,7 @@ on three of five codes, within ~4 % on the other two, while decoding more
 accurately (tet n=15: 0.011 vs 0.0144). Batch compaction between legs
 remains available headroom if relay throughput ever matters more than this.
 
-### Lessons that should outlive this log
+### Engineering lessons
 
 - **Never use sub-word types for contended Kokkos/CUDA atomics.** uint8
   atomics fall back to desul CAS/lock emulation; one flag view cost 200×.
@@ -671,9 +519,8 @@ remains available headroom if relay throughput ever matters more than this.
 - **Binding design is a pipeline stage.** nanobind zero-copy views +
   capsule-owned outputs make translate ≈ 0; per-shot result objects make it
   the dominant cost of an otherwise fast decoder.
-- **Benchmark CSVs and PNGs version independently of the code.** Pre-fix
-  CSVs and stale plot runs both misled; after decoder changes regenerate
-  data *and* both plot scripts.
+- **Benchmark CSVs and PNGs version independently of the code.** After
+  decoder changes, regenerate data *and* both plot scripts together.
 - With no profiler available, **two-point batch fits, max_iter sweeps and
   zero-syndrome decodes** separate launch overhead, per-shot compute, and
   BP vs OSD cost well enough to find 100× bugs.
