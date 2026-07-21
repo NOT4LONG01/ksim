@@ -76,6 +76,33 @@ Decision guide — which sampler to use:
 | Non-Clifford, many T-gates (t ≥ 15) | kokkos_sim | χ ≈ 2^{0.228t} beats 2^k at scale; GPU |
 | Rare-event LER (no millions of shots) | clifft | `sample_k()` importance sampling — unique |
 
+### External comparison: SOFT (generalized stabilizer tableau)
+
+[SOFT](https://arxiv.org/abs/2512.23037) (Li et al., 2025) is a closely related
+GPU non-Clifford simulator built on the *generalized stabilizer tableau*, a
+different stabilizer-decomposition route than the ZX stabilizer-rank sum here.
+Its representation cost is a coset bound `|v| ≤ 2^{|Q|−r_Z}` (nonzero tableau
+coefficients) — 16 for the d=3 magic-state-cultivation (MSC) circuit, 1024 for
+d=5 — rather than χ ≈ 2^{0.228t}. It reached the first ground-truth d=5 MSC
+simulation (42 qubits, 72 T/T†): >200 billion shots on 16 NVIDIA H800 GPUs over
+~20 days, showing the protocol's true logical error rate sits ~7.7–7.9× above
+the earlier Clifford-proxy estimates.
+
+The numbers below are **reported in that paper** (single H800, double precision),
+not re-run here — the dev cluster is CPU-only, and SOFT is GPU-only. The one
+overlapping circuit is d=3 cultivation:
+
+| circuit | SOFT (H800) | clifft (CPU AVX2) | note |
+|---|---|---|---|
+| MSC cultivation d=3 (peak_rank 4 / \|v\|≤16) | 6.68 µs/shot | 2.8 µs/shot | tiny active dimension — CPU wins, no launch overhead |
+| MSC cultivation d=5 (42 q, \|v\|≤1024) | 93.7 µs/shot | out of range | statevector/clifft cannot hold 42 qubits |
+
+SOFT's own baselines were CPU stabilizer-decomposition tools (Qiskit
+extended-stabilizer, stabilizer tensor network), which it beats by >10⁴×; it did
+not compare against stim/tsim/clifft/ksim. A fair kokkos_sim-vs-SOFT number on
+the same H800 would need running both on one GPU — noted here as future work, not
+claimed.
+
 ### Theoretical ground
 
 **stim** rests on the Gottesman–Knill theorem: a state reachable from |0…0⟩
