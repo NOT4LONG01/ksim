@@ -81,6 +81,28 @@ out = ks.sample(f, seed=42)    # (B, n_outputs); det = out[:, :flat.num_detector
 non-Clifford T circuit stim cannot touch, and the compile cache across a
 p-sweep).
 
+## Benchmark
+
+All on an NVIDIA A100-SXM4-80GB; full data and method in [`docs/benchmarks.md`](docs/benchmarks.md).
+
+**Sampler** — the ZX engine is exact *and* fast, no trade-off (5→1 magic-state distillation, 85-qubit encoded, 35k shots):
+
+| | tsim (JAX) | kokkos_sim | win |
+|---|---|---|---|
+| per-shot, encoded 85q | ~500 µs | **~1.6 µs** | ~350× faster |
+| amplitude deviation vs float64 | 2.7×10⁻⁸ | **1.1×10⁻¹⁶** | 8 orders tighter |
+
+Both evaluate the same exact ℤ[ω] sum — tsim pays for storing integers in complex64 and driving the loop through XLA dispatch; the fused int64 CUDA kernel pays neither. Sampling scales with T-count (χ ≈ 2^{0.228t}), not qubit count, so it reaches encoded circuits stim cannot express at all.
+
+**Decoders** — `kokkos_decoder` matches the reference decoders' accuracy and is the fastest in the comparison (LER at p=0.01; decode µs/shot, total excl. sampling):
+
+| code | best LER | kokkos:bp_osd | nv:bp_osd | ldpc:bp_osd |
+|---|---|---|---|---|
+| tri n=19 | 0.176 (relay) | **35 µs** | 169 µs | 10 693 µs |
+| tet n=15 | **0.0135** (relay, 3.7× lower than bp_osd) | 27 µs | 103 µs | 8 615 µs |
+
+`kokkos:bp_osd` predictions are bit-identical to `ldpc.BpOsdDecoder` at 2–5× nv's speed; `kokkos:relay_bp` matches or beats nv's Relay-BP on both accuracy and speed. The self-contained non-Clifford correctness gate (H·Tᵏ·H → exact P(1)) is in `tests/test_nonclifford.py`.
+
 ## Docs
 
 | | |
