@@ -15,6 +15,25 @@ stim.Circuit
 Exact ℤ[ω] int64 arithmetic on device — amplitude error ~1e-16 vs float64
 reference. One engine for Clifford and non-Clifford circuits alike.
 
+## How it works
+
+**stim** rests on Gottesman–Knill: a Clifford state is a stabilizer tableau,
+every gate a row update — but a T gate conjugates a Pauli into a non-Pauli, so
+the tableau has nowhere to put it. `ksim` changes representation: the circuit
+(composed with its adjoint) becomes a **ZX-calculus diagram** reduced by
+`pyzx_param`; T gates survive as π/4 phase spiders, and **stabilizer-rank
+decomposition** replaces each magic-spider group by a sum of ≈2^{αt} stabilizer
+terms (α<1 with cat-state strategies). Each output probability becomes an exact
+closed-form sum with coefficients in the ring **ℤ[ω], ω = e^{iπ/4}**. Sampling
+is autoregressive — one Bernoulli draw per output. Hardness is paid
+exponentially in T-count, polynomially in everything else.
+
+`ksim.compile` does the symbolic work in Python (on `pyzx_param`) and emits the
+flat numpy `FlatProgram`; `kokkos_sim` uploads it once and runs the whole
+autoregressive loop on GPU in int64 ℤ[ω] with power-of-2 renormalisation (or
+`ksim.sample_flat` runs the same on CPU, GPU-free). The precision and speed
+analysis behind the ~1e-16 figure is in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Install
 
 ```bash

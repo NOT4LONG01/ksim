@@ -4,12 +4,33 @@ All numbers: NVIDIA A100-SXM4-80GB. Figures are pre-generated in
 `../example/figure/`. Two parts:
 
 **Contents**
+- [Sampler validation — every backend must match stim](#validation)
 - [Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft](#part-1)
 - [Part 2 — Decoder evolution log: kokkos vs. nv-qldpc vs. ldpc](#part-2)
 
-The LER-agreement gates that hold these backends to stim's answer, and the
-pipeline profiles of the full QEC runs that consume them, live with the
-consumer: `docs/benchmarks.md` in `soft-info-code-switch`.
+The full-pipeline profiles of the QEC runs that *consume* these backends live
+with the consumer: `docs/benchmarks.md` in `soft-info-code-switch`.
+
+---
+
+<a name="validation"></a>
+## Sampler validation — every backend must match stim
+
+Before a sampler's speed means anything, its samples must be correct. The gate:
+fix a code, decoder, and shot budget, swap only the sampler, and require the
+logical error rates to agree within Wilson 95% intervals. A decoder only ever
+sees detector arrays and the DEM-derived `H`, so matching LER proves the
+samplers draw from the same noise model — sampler choice affects pipeline
+*speed only*, never accuracy.
+
+This is not a formality: it exposed four `kokkos_sim` bugs (measurement-record
+indexing, stim-format parsing, tableau phase tracking, multi-word memory
+layout) that made its samples decode to chance (LER ≈ 0.5) while its timing
+looked perfectly healthy. **Any new sampler must pass this gate before its
+speed is taken seriously.** The gate itself runs against real QEC codes in the
+consumer repo (`soft-info-code-switch`, `tests/test_comparison.py`); the
+self-contained non-Clifford correctness check (H·Tᵏ·H → exact P(1)) lives here
+in `tests/test_nonclifford.py`.
 
 ---
 
