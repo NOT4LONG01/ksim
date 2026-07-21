@@ -1,5 +1,4 @@
-# Build artifacts
-/build/
+build/
 *.so
 *.egg-info/
 __pycache__/
@@ -14,3 +13,7 @@ __pycache__/
 .vscode/
 .DS_Store
 .python-version
+
+# Benchmark outputs
+benchmarks/results/
+benchmarks/circuits/
