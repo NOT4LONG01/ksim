@@ -35,17 +35,23 @@ autoregressive loop on GPU in int64 ℤ[ω] with power-of-2 renormalisation (or
 
 ### Benchmark
 
-All on an NVIDIA A100-SXM4-80GB; full data and method in [`docs/benchmarks.md`](docs/benchmarks.md).
+Full data and method in [`docs/benchmarks.md`](docs/benchmarks.md).
 
-**Sampler** — non-Clifford throughput and precision (5→1 magic-state distillation, 35k shots; µs/shot):
+**Sampler** — non-Clifford throughput and precision, µs/shot (A100-SXM4-80GB, except clifft on a login node and xtim on a Xeon Gold 6548Y+; rows marked † are xtim's own protocol circuits with kokkos_sim beside it on one H100 NVL box — `benchmarks/bench_xtim.py`):
 
-| | tsim (JAX/GPU) | clifft (CPU) | kokkos_sim (GPU) |
-|---|---|---|---|
-| distillation logical 5q (peak_rank 2) | — | **0.27** | ~1.0 |
-| distillation encoded 85q | ~500 | ~100–10 000 | **~1.6** |
-| amplitude deviation vs float64 | 2.7×10⁻⁸ | ~1×10⁻¹⁵ | **1.1×10⁻¹⁶** |
+| | tsim (JAX/GPU) | clifft (CPU) | kokkos_sim (GPU) | xtim (CPU) |
+|---|---|---|---|---|
+| distillation logical 5q (peak_rank 2) | — | **0.27** | ~1.0 | n/m |
+| distillation encoded 85q | ~500 | ~100–10 000 | **~1.6** | n/m |
+| tet n=15 Clifford memory | 408 | 5.6 | 16.0 | **0.29** |
+| † d=3 cultivation, magic kept, 21q | — | — | 22.3 | **0.097** |
+| † d=5 cultivation, 61q / 11 T-gates | — | — | *compile exhausts 24 GB* | **4.81** |
+| † H·T·H·T·H (T-depth 2 after folding) | — | — | **0.25034** vs exact 0.25 | *`XtimRejectError`* |
+| amplitude deviation vs float64 | 2.7×10⁻⁸ | ~1×10⁻¹⁵ | **1.1×10⁻¹⁶** | ~1×10⁻¹⁵ |
 
-kokkos_sim and tsim run the same ZX stabilizer-rank sum, so both are exact — tsim just pays for storing ℤ[ω] integers in complex64 and driving the loop through XLA dispatch, which the fused int64 CUDA kernel avoids (~350× faster, 8 orders tighter precision). clifft is a different algorithm — a factored statevector, O(2^k) in the active dimension k — unbeatable at small peak_rank and the only one of the four with importance sampling for rare events, but its cost blows up as k grows with encoded T-gates, exactly where kokkos_sim's T-count scaling (χ ≈ 2^{0.228t}, not qubit count) wins and reaches circuits stim cannot express at all.
+kokkos_sim and tsim run the same ZX stabilizer-rank sum, so both are exact — tsim just pays for storing ℤ[ω] integers in complex64 and driving the loop through XLA dispatch, which the fused int64 CUDA kernel avoids (~350× faster, 8 orders tighter precision). clifft is a different algorithm — a factored statevector, O(2^k) in the active dimension k — unbeatable at small peak_rank and the only one with importance sampling for rare events, but its cost blows up as k grows with encoded T-gates, exactly where kokkos_sim's T-count scaling (χ ≈ 2^{0.228t}, not qubit count) wins and reaches circuits stim cannot express at all.
+
+[xtim](https://github.com/ikim-quantum/xtim) trades differently again: it simulates only circuits Clifford-equivalent to **one mutually-commuting layer of π/8 rotations**, but inside that class T-count is free (cost is χ = 2^{folded rank}, typically 2), no GPU is needed, and each shot carries the prepared state's exact ⟨P⟩. So it wins by 17–231× on magic-state preparation and reaches protocols our T-count decomposition cannot compile at all, while a single H between two T gates puts a circuit outside its class entirely — the last two † rows are that trade read in both directions. On Clifford circuits it sits at stim parity (0.7–1.3×) and reproduces stim's fire rates to within 2.8σ.
 
 | amplitude precision | per-shot cost |
 |---|---|
@@ -64,7 +70,7 @@ kokkos_sim and tsim run the same ZX stabilizer-rank sum, so both are exact — t
 |---|---|---|
 | ![kokkos bp_osd pipeline profile](example/figure/pipeline_profile_kokkos_bp_osd.png) | ![nv bp_osd pipeline profile](example/figure/pipeline_profile_nv_bp_osd.png) | ![ldpc bp_osd pipeline profile](example/figure/pipeline_profile_ldpc_bp_osd.png) |
 
-The self-contained non-Clifford correctness gate (H·Tᵏ·H → exact P(1)) is in `tests/test_nonclifford.py`.
+The self-contained non-Clifford correctness gate (H·Tᵏ·H → exact P(1), for every installed backend) and the xtim class-boundary check are in `tests/test_nonclifford.py`.
 
 ## Install
 
@@ -122,7 +128,7 @@ p-sweep).
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | The `FlatProgram` contract, the compile and sample halves, the `kokkos_decoder`/`kokkos_mcts` APIs, and the C++ conventions all three extensions share |
 | [`docs/build.md`](docs/build.md) | CPU (OpenMP) and CUDA build recipes, Kokkos reinstall, smoke test |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | Non-Clifford sampler deep dive (stim → tsim → kokkos_sim → clifft) and the decoder evolution log (kokkos vs nv-qldpc vs ldpc) |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Non-Clifford sampler deep dive (stim → tsim → kokkos_sim → clifft → xtim) and the decoder evolution log (kokkos vs nv-qldpc vs ldpc) |
 
 Portions of the compile side are derived from Apache-2.0 third-party software —
 see [`NOTICE`](NOTICE).

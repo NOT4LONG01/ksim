@@ -1,11 +1,11 @@
 # Benchmarks: the ZX sampler and the Kokkos decoders
 
-All numbers: NVIDIA A100-SXM4-80GB. Figures are pre-generated in
-`../example/figure/`. Two parts:
+All numbers: NVIDIA A100-SXM4-80GB, except where a table names its own machine.
+Figures are pre-generated in `../example/figure/`. Two parts:
 
 **Contents**
 - [Sampler validation — every backend must match stim](#validation)
-- [Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft](#part-1)
+- [Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft → xtim](#part-1)
 - [Part 2 — Decoders: kokkos_decoder vs. nv-qldpc vs. ldpc](#part-2)
 
 The full-pipeline profiles of the QEC runs that *consume* these backends live
@@ -32,48 +32,96 @@ consumer repo (`soft-info-code-switch`, `tests/test_comparison.py`); the
 self-contained non-Clifford correctness check (H·Tᵏ·H → exact P(1)) lives here
 in `tests/test_nonclifford.py`.
 
+xtim, the newest entrant, was held to it before any of its timings were
+recorded: exact P(1) on H·Tᵏ·H, and per-detector fire rates against kokkos_sim
+within 2.5σ across all six of its protocol circuits.
+
 ---
 
 <a name="part-1"></a>
-## Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft
+## Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft → xtim
 
-### Four-sampler comparison
+### Five-sampler comparison
 
-All four samplers available in this repo, by algorithm and measured properties:
+All five samplers compared here, by algorithm and measured properties:
 
-| | stim | tsim | kokkos_sim | clifft |
-|---|---|---|---|---|
-| algorithm | Gottesman–Knill tableau | ZX stabilizer-rank | ZX stabilizer-rank | Schrodinger-VM (factored statevector) |
-| substrate | C++/SIMD, CPU | XLA/JAX, GPU | Kokkos/CUDA, GPU | AVX2/AVX-512, CPU |
-| T-gate support | no | yes | yes | yes |
-| per-shot cost | O(n) Clifford | O(χ·n), complex64 dispatch | O(χ·n), int64 CUDA kernel | O(2^k), k = active dimension |
-| T-count scaling | — | χ ≈ 2^{0.228t} | χ ≈ 2^{0.228t} | 2^k_peak (grows with T in X/Y basis) |
-| amplitude precision | exact (GF(2)) | ~1e-8 (complex64 JAX) | ~1e-16 (int64 → float64) | ~1e-15 (float64) |
-| importance sampling | no | no | no | yes (`sample_k()`) |
-| sampler build time | none | 9.5–14.1 s XLA JIT | 0.13–0.25 s GPU upload | ~0 ms |
-| GPU required | no | yes | yes | no |
-| package | core dep | `baselines` extra | C++ build + `baselines` | `baselines` extra |
+| | stim | tsim | kokkos_sim | clifft | xtim |
+|---|---|---|---|---|---|
+| algorithm | Gottesman–Knill tableau | ZX stabilizer-rank | ZX stabilizer-rank | Schrodinger-VM (factored statevector) | folded π/8 layer + exact reference state |
+| substrate | C++/SIMD, CPU | XLA/JAX, GPU | Kokkos/CUDA, GPU | AVX2/AVX-512, CPU | C++17, CPU |
+| T-gate support | no | yes | yes | yes | yes, but only *one commuting π/8 layer* |
+| per-shot cost | O(n) Clifford | O(χ·n), complex64 dispatch | O(χ·n), int64 CUDA kernel | O(2^k), k = active dimension | O(χ), χ = 2^{folded rank} |
+| T-count scaling | — | χ ≈ 2^{0.228t} | χ ≈ 2^{0.228t} | 2^k_peak (grows with T in X/Y basis) | none — T-count is free inside the class |
+| accepts arbitrary T structure | no (no T at all) | yes | yes | yes | **no** — refuses T-depth ≥ 2 after folding |
+| amplitude precision | exact (GF(2)) | ~1e-8 (complex64 JAX) | ~1e-16 (int64 → float64) | ~1e-15 (float64) | ~1e-15 (float64) |
+| importance sampling | no | no | no | yes (`sample_k()`) | no |
+| exact per-shot ⟨P⟩ of the output state | no | no | no | no | **yes** (`PAULI_EXPECTATION`) |
+| sampler build time | none | 9.5–14.1 s XLA JIT | 0.13–0.25 s GPU upload | ~0 ms | 1–68 ms reference compile |
+| GPU required | no | yes | yes | no | no |
+| package | core dep | `baselines` extra | C++ build + `baselines` | `baselines` extra | `pip install xtim` |
 
-Measured throughput (µs/shot, 10 000 shots; stim/tsim/kokkos_sim on A100, clifft on login node AVX2):
+Measured throughput (µs/shot, 10 000 shots; stim/tsim/kokkos_sim on A100,
+clifft on login node AVX2, xtim on Xeon Gold 6548Y+ AVX-512). Memory circuits
+are `rounds = d` at depolarizing p = 0.01; the magic-state protocols marked †
+are xtim's own bundled examples at 1 000 000 shots with kokkos_sim re-measured
+beside it on one box (H100 NVL / Xeon Gold 6548Y+) — `benchmarks/bench_xtim.py`:
 
-| code | stim | tsim | kokkos_sim | clifft |
-|---|---|---|---|---|
-| surface d=3 (Clifford, peak_rank=0) | 0.17 | 191 | 2.6 | 1.5 |
-| surface d=5 (Clifford, peak_rank=0) | 0.79 | 292 | 18.5 | 7.1 |
-| tri n=7 (Clifford, peak_rank=0) | 0.23 | 59 | 3.7 | 1.7 |
-| tri n=19 (Clifford, peak_rank=0) | 0.87 | 259 | 25.1 | 8.7 |
-| tet n=15 (Clifford, peak_rank=0) | 0.54 | 408 | 16.0 | 5.6 |
-| 5→1 distillation logical 5q (peak_rank=2) | — | — | ~1.0 | **0.27** |
-| 5→1 distillation encoded 85q | — | ~500 | **~1.6** | ~100–10 000 (est.) |
-| cultivation d=3 (T-gate, peak_rank=4) | — | — | — | **2.8** |
+| code | stim | tsim | kokkos_sim | clifft | xtim |
+|---|---|---|---|---|---|
+| surface d=3 (Clifford, peak_rank=0) | 0.17 | 191 | 2.6 | 1.5 | **0.12** |
+| surface d=5 (Clifford, peak_rank=0) | 0.79 | 292 | 18.5 | 7.1 | **0.43** |
+| tri n=7 (Clifford, peak_rank=0) | 0.23 | 59 | 3.7 | 1.7 | **0.13** |
+| tri n=19 (Clifford, peak_rank=0) | 0.87 | 259 | 25.1 | 8.7 | **0.48** |
+| tet n=15 (Clifford, peak_rank=0) | 0.54 | 408 | 16.0 | 5.6 | **0.29** |
+| 5→1 distillation logical 5q (peak_rank=2) | — | — | ~1.0 | **0.27** | n/m |
+| 5→1 distillation encoded 85q | — | ~500 | **~1.6** | ~100–10 000 (est.) | n/m |
+| cultivation d=3 (T-gate, peak_rank=4) | — | — | — | **2.8** | n/m |
+| † teleported T\|+⟩ in a rep code, 5q (χ=2) | — | — | 0.029 | — | 0.030 |
+| † d=3 cultivation, Clifford twin, 21q (χ=1) | — | — | 0.107 | — | **0.081** |
+| † code switching, count-matched twin, 44q (χ=2) | — | — | 0.146 | — | 0.145 |
+| † 15→1 distillation, 29q (χ=2) | — | — | 0.487 | — | **0.028** |
+| † code switching, magic kept, 44q (χ=2) | — | — | 23.2 | — | **0.813** |
+| † d=3 cultivation, magic kept, 21q (χ=2) | — | — | 22.3 | — | **0.097** |
+| † d=5 cultivation, 61q / 11 T-gates (χ=2) | — | — | *compile exhausts 24 GB* | — | **4.81** |
+
+`n/m` = not measured: those three circuits are not reproducible in this repo
+(the 85q encoded workload needs tsim's generator, the logical 5q ladder and the
+cultivation d=3 circuit were built by the tsim/clifft benchmarks). For the
+cross-machine rows, the calibration is stim itself: re-measured on the xtim box
+it runs the five memory circuits at 0.10–0.55 µs/shot against the 0.17–0.87 in
+its column, so this CPU is 1.4–2.3× the old one — xtim's Clifford numbers are at
+stim parity (0.7–1.3× stim measured side by side), not a machine artefact.
+
+That parity is the sanity check that xtim's extensions cost nothing when unused:
+it is a stim superset, so those rows exercise the same tableau work through a
+different engine, and its detector fire rates match stim's to within 1.4–2.8σ
+over 18–120 detectors at 400 000 shots (mean |Δp| ≈ 0.0006, the two-sample
+shot-noise floor). `bench_xtim.py --clifford` runs exactly this check.
+
+The † rows are where the two exponentials pull against each other. Putting the
+magic back into a protocol costs us 208× on d=3 cultivation (0.107 → 22.3) and
+159× on code switching, because our χ ≈ 2^{0.228t} grows with the T-count; it
+costs xtim 1.2× and 5.6×, because its χ is 2^{rank of the folded π/8 layer} and
+a single-magic-output protocol has rank 1 no matter how many T-gates feed it. On
+the d=5 cultivation fixture (61 qubits, 11 T/T_DAG gates) our symbolic compile
+exhausted a 24 GB cap after 414 s without emitting a program at all, while xtim
+built its reference in 0.15 s and sampled 107 detectors at 4.81 µs/shot. But the
+class restriction is a refusal, not a slope: H·T·H·T·H is T-depth 2 after
+folding, so xtim returns `XtimRejectError` while kokkos_sim samples it at the
+closed-form P(1) = 0.25 (measured 0.25034), and no χ budget buys that back.
+One-time costs over the † rows: `ksim.compile` 0.01–7.4 s plus a 0.5–373 ms GPU
+upload, against 1–68 ms for xtim's reference compile. Detector fire rates from
+the two engines agree to within 2.5σ over all 100 detectors compared.
 
 Decision guide — which sampler to use:
 
 | workload | winner | reason |
 |---|---|---|
 | Clifford-only QEC memory | stim | pure tableau, zero floating point, fastest |
+| Magic-state prep inside generalized T-depth 1 | xtim | χ = 2^{folded rank}, T-count free; exact per-shot ⟨P⟩ |
 | Non-Clifford, small peak_rank (k ≤ ~8) | clifft | 2^k ≤ 256 amplitudes, no GPU needed |
 | Non-Clifford, many T-gates (t ≥ 15) | kokkos_sim | χ ≈ 2^{0.228t} beats 2^k at scale; GPU |
+| T-depth ≥ 2 after folding (xtim refuses) | kokkos_sim | stabilizer-rank has no structural restriction on the T layer |
 | Rare-event LER (no millions of shots) | clifft | `sample_k()` importance sampling — unique |
 
 ### Theoretical ground
@@ -112,6 +160,24 @@ Per-shot cost is O(2^k) against the stabilizer-rank sum's O(χ), χ ≈
 the *T-count*, which is why clifft wins when k stays small and loses when it
 doesn't. It also does exact arithmetic in float64 rather than ℤ[ω], so unlike
 tsim it has no complex64-rounding penalty to pay.
+
+**xtim** ([github.com/ikim-quantum/xtim](https://github.com/ikim-quantum/xtim),
+[arXiv:2512.23799](https://arxiv.org/abs/2512.23799)) takes the fourth route,
+and is the only one of the five that buys its speed with a *restriction on the
+circuit class* rather than a representation trade-off. Take every non-Clifford
+gate — it reads `T`, `CS`, `CCZ` and `CH` on top of the stim language — expand
+it into π/8 Pauli-product rotations, and commute each one back through the
+Cliffords that precede it, conjugating its Pauli rotation axis on the way. If
+all the folded axes mutually commute ("generalized T-depth 1") the circuit is
+Clifford-equivalent to a single commuting π/8 layer on a stabilizer state, and
+xtim simulates it exactly: one reference state built by stabilizer-rank
+decomposition at compile time, then per-shot work proportional to χ = 2^{rank of
+that folded layer}. T-count does not enter the cost — 15 T-gates and 1 T-gate
+both fold to χ = 2 if their axes agree — and its `PAULI_EXPECTATION` columns
+return the prepared state's exact per-shot ⟨P⟩ rather than a sampled outcome.
+If any two folded axes anticommute the circuit is refused outright
+(`XtimRejectError`), and no χ budget buys it back: exponential in the *output
+magic rank*, with a hard wall instead of a slope.
 
 (The symbolic-compile half is the in-repo `ksim.compile` — `pyzx_param` directly,
 no `bloqade-tsim`; `kokkos_sim`'s numeric half is independent of it. How the
@@ -183,28 +249,38 @@ The logical circuit (unencoded view, rendered with tsim's stim-style
 | workload | winner | reason |
 |---|---|---|
 | Clifford circuits (QEC memory) | stim | pure tableau, no floating point |
+| Magic-state prep, one commuting π/8 layer | **xtim** | χ = 2^{folded rank}; T-count free; exact per-shot ⟨P⟩ |
 | Small non-Clifford, low peak_rank (≤ ~10) | **clifft** | trivial statevector, no GPU needed |
 | Large non-Clifford, many T-gates (t ≥ 15) | **kokkos_sim** | stabilizer-rank scales with T-count, not qubit-count; GPU throughput |
+| Any T structure at all (T-depth ≥ 2 folded) | **kokkos_sim** | the only engine here with no restriction on the T layer |
 | Rare-event LER estimation | **clifft** | importance sampling via `sample_k()` |
 
 ### Precision and error analysis
 
 Error sources, ranked by size:
 
-| Source | stim | tsim (JAX) | kokkos_sim | clifft |
-|---|---|---|---|---|
-| Monte-Carlo shot noise | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) |
-| decomposition truncation | n/a | **0** (exact, not approximate) | **0** | n/a (dense statevector, no decomposition) |
-| term/state arithmetic | exact (GF(2) bits) | exact ℤ[ω], but carried in float32 | exact ℤ[ω] in int64 | complex128 statevector |
-| complex conversion | n/a | complex64 → ~1e-7 rel. | float64 → ~1e-16 rel. | float64 → ~1e-16 rel. |
-| measured amplitude deviation* | — | 2.7 × 10⁻⁸ | 1.1 × 10⁻¹⁶ | ~1×10⁻¹⁵ (expected, not directly measured) |
+| Source | stim | tsim (JAX) | kokkos_sim | clifft | xtim |
+|---|---|---|---|---|---|
+| Monte-Carlo shot noise | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2) | ~N^(−1/2), over noise draws only |
+| decomposition truncation | n/a | **0** (exact, not approximate) | **0** | n/a (dense statevector, no decomposition) | **0** (exact reference state) |
+| term/state arithmetic | exact (GF(2) bits) | exact ℤ[ω], but carried in float32 | exact ℤ[ω] in int64 | complex128 statevector | complex128 reference amplitudes |
+| complex conversion | n/a | complex64 → ~1e-7 rel. | float64 → ~1e-16 rel. | float64 → ~1e-16 rel. | float64 → ~1e-16 rel. |
+| measured amplitude deviation* | — | 2.7 × 10⁻⁸ | 1.1 × 10⁻¹⁶ | ~1×10⁻¹⁵ (expected, not directly measured) | ~1×10⁻¹⁵ (expected, not directly measured) |
 
 \*max |amplitude − float64 reference| across all compiled graphs of the
-distillation workloads; clifft's row is the expected float64 rounding floor,
-not a value measured the same way (no shared reference graph to diff against
-— it never builds a ZX/stabilizer-rank graph at all). Why the arithmetic
-stays exact and where the error floor comes from:
+distillation workloads; the clifft and xtim rows are the expected float64
+rounding floor, not values measured the same way (no shared reference graph to
+diff against — neither builds a ZX/stabilizer-rank graph in the shape ours
+emits). Why the arithmetic stays exact and where the error floor comes from:
 [`docs/architecture.md`](architecture.md) `kokkos_sim` section.
+
+xtim's shot-noise row is qualified because its detector and observable columns
+are Monte-Carlo like everyone else's, while its `PAULI_EXPECTATION` columns are
+computed rather than sampled: each shot carries the exact ⟨P⟩ conditioned on
+that shot's faults, so averaging still converges as ~N^(−1/2) but from a
+lower-variance estimator. On the 15→1 distillation at p=0.01 (20 000 shots),
+post-selecting the four X-stabilizer detectors (85.6 % acceptance) gives
+⟨X̄⟩ = 0.70702 ± 0.00008 against the ideal 0.707107.
 
 Validation gates (all passing): per-graph |amplitude| vs the NumPy float64
 reference; exact single-T and double-T statistics (H·T·H → 0.1454 vs exact
@@ -323,6 +399,40 @@ clifft's value in this project would be (a) T-gate circuits where T is in
 observable position (magic-state distillation, logical T injection via
 transversal on codes that support it), or (b) importance sampling (`sample_k()`)
 for rare-event LER estimation — a capability neither stim nor ksim offer today.
+
+### Summary — what each sampler pays for, and what it cannot do
+
+None of these engines truncates its decomposition — the precision spread in the
+table above is floating-point rounding, not approximation. What separates them
+is *which quantity the cost is exponential in*, and each one's limit is the
+direct consequence of that choice.
+
+| sampler | representation | exponential in | fastest at | cannot do |
+|---|---|---|---|---|
+| **stim** | Aaronson–Gottesman tableau | nothing (polynomial) | Clifford memory: 0.17–0.87 µs/shot, unbeatable | any T gate — a T conjugates a Pauli out of the group |
+| **tsim** | ZX stabilizer-rank, complex64 on XLA | T-count, χ ≈ 2^{0.228t} | nothing in this comparison | reach kokkos_sim's precision (2.7e-8 vs 1.1e-16) or amortize its 9.5–14.1 s JIT per circuit shape |
+| **kokkos_sim** | ZX stabilizer-rank, int64 ℤ[ω] on CUDA | T-count, χ ≈ 2^{0.228t} | encoded non-Clifford at batch scale: 85q distillation at ~1.6 µs/shot, ~350× faster than tsim | survive a large T-count — d=5 cultivation (11 T-gates) exhausted 24 GB of compile without emitting a program |
+| **clifft** | factored statevector over the active subspace | active dimension k, 2^k | small non-Clifford, low peak_rank: 0.27 µs/shot on the logical 5q distillation; the only importance sampler (`sample_k()`) | hold up as k grows — the 85q encoded circuit is est. 100–10 000 µs/shot |
+| **xtim** | one folded π/8 layer + exact reference state | folded magic rank, χ = 2^{rank} | magic-state preparation: 0.03–4.8 µs/shot regardless of T-count; the only exact per-shot ⟨P⟩ | anything outside generalized T-depth 1 — a single H between two T gates is a hard refusal |
+
+Read as a decision, that is four regimes. Clifford work belongs to stim, and
+nothing else comes close. Magic-state *preparation*
+protocols belong to xtim when their folded axes commute, which is the common
+case for cultivation, distillation, injection and code switching — it is
+17–231× cheaper per shot than we are and reaches protocols our decomposition
+cannot compile. Everything else non-Clifford is a choice between two
+exponentials: clifft when the active dimension stays small, kokkos_sim when it
+does not but the T-count is moderate — and kokkos_sim alone when the T layer has
+no exploitable structure at all, since it is the only engine here that imposes
+no condition on where the T gates sit. tsim is superseded: it runs the same sum
+as kokkos_sim, ~350× slower and eight orders less precise, and is kept only as
+the independent implementation that cross-checks it.
+
+The two gaps this leaves are worth naming. We have no importance sampling, so
+rare-event LER still costs us millions of shots where clifft's `sample_k()`
+would not; and we emit no exact per-shot expectation value, so magic-state
+fidelity has to be reconstructed from measurement statistics that xtim reports
+directly.
 
 ---
 
