@@ -20,3 +20,5 @@ benchmarks/circuits/
 
 # xtim writes its compiled-reference cache next to the working directory
 .xtim_cache/
+
+avail.sh
