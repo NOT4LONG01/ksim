@@ -140,24 +140,29 @@ void bp_run_memory(
     int max_iter,
     BpWorkspace& ws);
 
+// Named as in arXiv:2506.01779: legs r = 0..R-1, leg 0 runs T0 iterations of
+// BP with the uniform memory gamma0 (Mem-BP), every later leg Tr iterations
+// with gamma_j ~ U[gamma_center - gamma_width/2, gamma_center + gamma_width/2]
+// (DMem-BP); S is the number of solutions sought.  Defaults are the paper's
+// gross-code values.
 struct RelayConfig {
-    int   pre_iter      = 80;     // BP iterations before the relay legs
-    int   num_legs      = 100;    // number of memory-BP legs
-    int   leg_max_iter  = 60;     // iterations per relay leg
-    float gamma_min     = -0.24f; // leg gamma ~ Uniform[gamma_min, gamma_max]
-    float gamma_max     =  0.66f;
-    float gamma0        = 0.0f;   // uniform memory strength during pre_iter (0 = plain BP)
-    int   stop_nconv    = 1;      // converged solutions to collect per shot; <= 0 runs every leg
-    uint64_t seed       = 42;
+    int   R            = 301;     // maximum number of legs, the first included
+    int   T0           = 80;      // iterations of leg 0
+    int   Tr           = 60;      // iterations of every later leg
+    float gamma0       = 0.125f;  // uniform memory strength of leg 0 (0 = plain BP)
+    float gamma_center = 0.21f;   // the interval [-0.24, 0.66]
+    float gamma_width  = 0.90f;
+    int   S            = 1;       // solutions sought per shot; <= 0 runs every leg
+    uint64_t seed      = 42;
 };
 
-// Relay BP (arXiv:2506.01779): pre_iter iterations of BP (memory gamma0 if
-// non-zero), then num_legs legs of disordered-memory BP.  Every leg restarts the
+// Relay BP (arXiv:2506.01779): leg 0 is T0 iterations of BP with memory gamma0,
+// legs 1..R-1 are Tr iterations of disordered-memory BP.  Every leg restarts the
 // messages from the channel priors and keeps only the previous posterior as its
-// memory (the relay).  A shot keeps decoding until it has produced stop_nconv
-// converged solutions and returns the one of lowest prior weight (Relay-BP-S);
-// a shot that never converges falls back to OSD-0.  converged reports whether
-// any leg converged.
+// memory (the relay).  A shot keeps decoding until it has produced S converged
+// solutions and returns the one of lowest prior weight (Relay-BP-S); a shot
+// that never converges falls back to OSD-0.  converged reports whether any leg
+// converged.
 BpResult relay_bp_decode_batch(
     const EdgeTable& et,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_dev,

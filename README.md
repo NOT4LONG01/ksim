@@ -64,7 +64,7 @@ kokkos_sim and tsim run the same ZX stabilizer-rank sum, so both are exact — t
 | tri n=19 | 0.176 (relay) | **35 µs** | 169 µs | 10 693 µs |
 | tet n=15 | **0.0135** (relay, 3.7× lower than bp_osd) | 27 µs | 103 µs | 8 615 µs |
 
-`kokkos:bp_osd` predictions match `ldpc.BpOsdDecoder` (identical wherever BP converges, equal LER where OSD-0 runs) at 2–5× nv's speed; `kokkos:relay_bp` matches or beats nv's Relay-BP on both accuracy and speed. The per-stage cost — kokkos pays a kernel-launch train, nv gives it back translating per-shot result objects, ldpc is pure CPU compute:
+`kokkos:bp_osd` predictions match `ldpc.BpOsdDecoder` (identical wherever BP converges, equal LER where OSD-0 runs; [docs/decoder_verification.md](docs/decoder_verification.md)) at 2–5× nv's speed; `kokkos:relay_bp` matches or beats nv's Relay-BP on both accuracy and speed. The per-stage cost — kokkos pays a kernel-launch train, nv gives it back translating per-shot result objects, ldpc is pure CPU compute:
 
 | kokkos:bp_osd | nv:bp_osd | ldpc:bp_osd |
 |---|---|---|

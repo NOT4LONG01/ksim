@@ -224,20 +224,29 @@ leg for `RelayBpDecoder`) supplied the prediction.
   logical outcome, and ldpc's stable sort of its double-rounding noise picks
   differently from any deterministic rule; that is a property of OSD-0 on a
   tiny code, not a difference in the BP.
-- `RelayBpDecoder` (arXiv:2506.01779): `pre_iter` iterations of BP (memory
-  `gamma0` if non-zero), then `num_legs` disordered-memory legs
-  (per-(shot, variable) γ ~ U[gamma_min, gamma_max], re-drawn each leg via
-  on-device splitmix64 hash, applied as a prior↔posterior blend). Each leg
-  restarts the messages from the priors and keeps only the previous posterior
-  as memory — the relay. A shot decodes until it has produced `stop_nconv`
-  converged solutions and returns the one of lowest prior weight (5 is the
-  paper's Relay-BP-S; `<= 0` runs every leg); shots that never converge fall
-  back to OSD-0. **Short legs win**: `leg_max_iter ≈ 8` with 10–20 legs beats
-  `leg_max_iter = 30` on both LER and speed — the γ re-randomisation, not BP
-  depth, is what escapes trapping sets. With the reference's own settings
-  (`gamma0=0.1, num_legs=300, leg_max_iter=60, stop_nconv=5`) it lands on the
-  reference implementation's LER (tetrahedral n=15, p=5e-3, 20 000 shots:
-  4.5e-4 vs 4.0e-4), where `stop_nconv=1` plain-BP pre-phase gives 1.25e-3.
+- `RelayBpDecoder`, named as in arXiv:2506.01779: `R` legs, the first `T0`
+  iterations of BP with the uniform memory `gamma0` (Mem-BP), each later one
+  `Tr` iterations of disordered-memory BP (per-(shot, variable)
+  γ ~ U[gamma_center − gamma_width/2, gamma_center + gamma_width/2], re-drawn
+  each leg via on-device splitmix64 hash, applied as a prior↔posterior blend).
+  Each leg restarts the messages from the priors and keeps only the previous
+  posterior as memory — the relay. A shot decodes until it has produced `S`
+  converged solutions and returns the one of lowest prior weight (Relay-BP-S;
+  `S <= 0` runs every leg); shots that never converge fall back to OSD-0.
+  Defaults are the paper's gross-code values (`R=301, T0=80, Tr=60,
+  gamma0=0.125`, interval [−0.24, 0.66], `S=1`). `gamma0` is code-specific, as the
+  paper says: on tetrahedral n=15 at `S=1` it swings the LER two-fold (0.125 the
+  worst of {0, 0.05, 0.1, 0.125, 0.2}, 0.2 the best), at `S=5` every value lands
+  within noise. `S` is the cheap knob: at p=5e-3 on tetrahedral n=15,
+  `S=5` cuts the LER about three-fold over `S=1` at every leg setting (87 → 31
+  failures in 40 000 shots at `R=21, Tr=8`, for no extra time, since the legs
+  run anyway) and `S=9` adds little; at p=1e-2 the gain needs the paper's long
+  legs (449 → 304 at `R=301, Tr=60, S=9`). **Short legs win**: `Tr ≈ 8`
+  with `R` of 11–21 beats `Tr = 30` on both LER and speed — the γ
+  re-randomisation, not BP depth, is what escapes trapping sets. With the
+  reference implementation's settings (`gamma0=0.1, R=301, Tr=60, S=5`) it
+  lands on that implementation's LER (tetrahedral n=15, p=5e-3, 20 000 shots:
+  4.5e-4 vs 4.0e-4), where `S=1` with a plain-BP first leg gives 1.25e-3.
 - `BpLsdDecoder`: GPU BP runs in batch; non-converged shots fall through to CPU
   cluster BFS + brute force (≤ `max_cluster_bits`) or OSD-0. The hybrid keeps
   mean throughput fast while improving accuracy on hard instances.
@@ -246,7 +255,8 @@ Source layout: `bp_decoders.hpp` (the API) + `bp_infra.cpp`, `bp_osd.cpp`,
 `bp_lsd.cpp`, `relay_bp.cpp` + `kokkos_decoder.cpp` (nanobind entry).
 
 How these compare to nv-qldpc and Roffe's `ldpc`, and how they got there:
-[`benchmarks.md`](benchmarks.md) Part 2.
+[`benchmarks.md`](benchmarks.md) Part 2. What they are verified against, shot for
+shot, and the defects that verification removed: [`decoder_verification.md`](decoder_verification.md).
 
 ---
 

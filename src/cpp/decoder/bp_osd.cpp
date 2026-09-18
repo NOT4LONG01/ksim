@@ -104,12 +104,13 @@ void bp_run(const EdgeTable& et, int B, int max_iter, BpWorkspace& ws) {
                 Kokkos::atomic_fetch_xor(&row_par(s, row(e)),
                                          (unsigned int)pred(s, col(e)));
             });
-        Kokkos::parallel_for("check_conv",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nc}),
-            KOKKOS_LAMBDA(int s, int r) {
+        // one writer per shot, so the flag is never a racing byte
+        Kokkos::parallel_for("check_conv", B, KOKKOS_LAMBDA(int s) {
+            for (int r = 0; r < nc; ++r) {
                 unsigned int want = (syn_f(s,r) > 0.5f) ? 1u : 0u;
-                if (row_par(s,r) != want) conv(s) = 0;
-            });
+                if (row_par(s,r) != want) { conv(s) = 0; break; }
+            }
+        });
         // conv flags update on-device every iteration; the host-blocking
         // early-exit count only runs periodically to avoid a sync per iteration.
         if (iter % 8 == 7 || iter == max_iter - 1) {

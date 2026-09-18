@@ -113,12 +113,13 @@ void bp_run_memory(
                 Kokkos::atomic_fetch_xor(&row_par(s, row(e)),
                                          (unsigned int)pred(s, col(e)));
             });
-        Kokkos::parallel_for("mcheck_conv",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nc}),
-            KOKKOS_LAMBDA(int s, int r) {
+        // one writer per shot, so the flag is never a racing byte
+        Kokkos::parallel_for("mcheck_conv", B, KOKKOS_LAMBDA(int s) {
+            for (int r = 0; r < nc; ++r) {
                 unsigned int want = (syn_f(s,r) > 0.5f) ? 1u : 0u;
-                if (row_par(s,r) != want) conv(s) = 0;
-            });
+                if (row_par(s,r) != want) { conv(s) = 0; break; }
+            }
+        });
         // Host-blocking early-exit count only every few iterations.
         if (iter % 8 == 7 || iter == max_iter - 1) {
             int num_nc = 0;
@@ -140,7 +141,7 @@ KOKKOS_INLINE_FUNCTION uint64_t splitmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-// A shot is done once it holds stop_nconv converged solutions (never, if <= 0).
+// A shot is done once it holds S converged solutions (never, if S <= 0).
 KOKKOS_INLINE_FUNCTION bool relay_done(int nconv, int stop) {
     return stop > 0 && nconv >= stop;
 }
@@ -173,7 +174,7 @@ BpResult relay_bp_decode_batch(
     upload_syndromes(syndromes, B, ws);
 
     const int nb = et.num_bits, E = et.num_edges;
-    const int stop = cfg.stop_nconv;
+    const int stop = cfg.S;
     auto pair_B  = Kokkos::make_pair(0, B);
     auto tlr_sub = Kokkos::subview(ws.total_llr, pair_B, Kokkos::ALL());
     auto old_sub = Kokkos::subview(ws.tlr_old,   pair_B, Kokkos::ALL());
@@ -189,27 +190,27 @@ BpResult relay_bp_decode_batch(
     auto nconv  = ws.nconv;
     auto tlr_old = ws.tlr_old;
 
-    // Phase 1: pre_iter iterations of BP, with uniform memory gamma0 if asked for.
+    // Leg 0: T0 iterations of BP, with the uniform memory gamma0 if non-zero.
     if (cfg.gamma0 != 0.0f) {
         bp_run(et, B, 0, ws);   // messages from the priors, conv cleared
         Kokkos::deep_copy(gam_sub, cfg.gamma0);
-        Kokkos::parallel_for("relay_pre_memory",
+        Kokkos::parallel_for("relay_leg0_memory",
             Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
             KOKKOS_LAMBDA(int s, int j) { tlr_old(s,j) = ch_llr(j); });
-        bp_run_memory(et, B, cfg.pre_iter, ws);
+        bp_run_memory(et, B, cfg.T0, ws);
     } else {
-        bp_run(et, B, cfg.pre_iter, ws);
+        bp_run(et, B, cfg.T0, ws);
     }
     relay_record(B, nb, et, stop, ws);
 
-    // Phase 2: relay legs.  Each leg restarts the messages from the priors and
-    // keeps only the previous posterior, blended in through a fresh gamma field.
+    // Legs 1..R-1.  Each leg restarts the messages from the priors and keeps
+    // only the previous posterior, blended in through a fresh gamma field.
     Kokkos::deep_copy(old_sub, tlr_sub);
     auto gam = ws.gamma;
     const uint64_t seed = cfg.seed ^ 0xdeadbeefcafeULL;
-    const float gmin = cfg.gamma_min, grange = cfg.gamma_max - cfg.gamma_min;
+    const float gmin = cfg.gamma_center - 0.5f * cfg.gamma_width, grange = cfg.gamma_width;
 
-    for (int leg = 0; leg < cfg.num_legs; ++leg) {
+    for (int leg = 1; leg < cfg.R; ++leg) {
         int active = 0;
         Kokkos::parallel_reduce("relay_active", B,
             KOKKOS_LAMBDA(int s, int& acc) { if (!relay_done(nconv(s), stop)) ++acc; },
@@ -236,11 +237,11 @@ BpResult relay_bp_decode_batch(
         Kokkos::parallel_for("relay_leg_reopen", B,
             KOKKOS_LAMBDA(int s) { if (!relay_done(nconv(s), stop)) conv(s) = 0; });
 
-        bp_run_memory(et, B, cfg.leg_max_iter, ws);
+        bp_run_memory(et, B, cfg.Tr, ws);
         relay_record(B, nb, et, stop, ws);
     }
 
-    // Phase 3: shots with a converged solution return their best one; the rest
+    // Shots with a converged solution return their best one; the rest
     // go to OSD-0 on the last leg's posteriors.  converged = any leg converged.
     auto pred = ws.pred;  auto best = ws.best_pred;
     Kokkos::parallel_for("relay_best",

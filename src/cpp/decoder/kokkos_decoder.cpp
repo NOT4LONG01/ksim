@@ -136,15 +136,15 @@ struct RelayBpDecoder {
     RelayBpDecoder(
         nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig> H,
         nb::ndarray<float,   nb::ndim<1>, nb::c_contig> priors,
-        int max_batch   = 4096,
-        int pre_iter    = 80,
-        int num_legs    = 100,
-        int leg_max_iter = 60,
-        float gamma_min  = -0.24f,
-        float gamma_max  =  0.66f,
-        int stop_nconv   = 1,
-        uint64_t seed    = 42,
-        float gamma0     = 0.0f)
+        int max_batch      = 4096,
+        int R              = 301,
+        int T0             = 80,
+        int Tr             = 60,
+        float gamma0       = 0.125f,
+        float gamma_center = 0.21f,
+        float gamma_width  = 0.90f,
+        int S              = 1,
+        uint64_t seed      = 42)
         : max_batch_(max_batch)
     {
         ensure_kokkos();
@@ -153,13 +153,13 @@ struct RelayBpDecoder {
         int osd_b = osd_chunk_size(max_batch, et.num_checks, et.num_bits);
         osd_ws = asy::OsdWorkspace(osd_b, et.num_checks, et.num_bits, max_batch);
         H_dev  = asy::build_H_dense(et);
-        cfg.pre_iter     = pre_iter;
-        cfg.num_legs     = num_legs;
-        cfg.leg_max_iter = leg_max_iter;
-        cfg.gamma_min    = gamma_min;
-        cfg.gamma_max    = gamma_max;
+        cfg.R            = R;
+        cfg.T0           = T0;
+        cfg.Tr           = Tr;
         cfg.gamma0       = gamma0;
-        cfg.stop_nconv   = stop_nconv;
+        cfg.gamma_center = gamma_center;
+        cfg.gamma_width  = gamma_width;
+        cfg.S            = S;
         cfg.seed         = seed;
     }
 
@@ -261,22 +261,23 @@ NB_MODULE(kokkos_decoder, m) {
         .def(nb::init<
                 nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig>,
                 nb::ndarray<float,   nb::ndim<1>, nb::c_contig>,
-                int, int, int, int, float, float, int, uint64_t, float>(),
+                int, int, int, int, float, float, float, int, uint64_t>(),
              "H"_a, "priors"_a,
-             "max_batch"_a   = 4096,
-             "pre_iter"_a    = 80,
-             "num_legs"_a    = 100,
-             "leg_max_iter"_a = 60,
-             "gamma_min"_a   = -0.24f,
-             "gamma_max"_a   =  0.66f,
-             "stop_nconv"_a  = 1,
-             "seed"_a        = (uint64_t)42,
-             "gamma0"_a      = 0.0f,
-             "Relay BP decoder (arXiv:2506.01779): pre_iter BP iterations (memory gamma0 if"
-             " non-zero), then num_legs disordered-memory legs restarted from the priors with the"
-             " previous posterior relayed as memory. Each shot collects stop_nconv converged"
-             " solutions (<= 0: every leg) and returns the lowest prior weight; OSD-0 on shots that"
-             " never converge.")
+             "max_batch"_a    = 4096,
+             "R"_a            = 301,
+             "T0"_a           = 80,
+             "Tr"_a           = 60,
+             "gamma0"_a       = 0.125f,
+             "gamma_center"_a = 0.21f,
+             "gamma_width"_a  = 0.90f,
+             "S"_a            = 1,
+             "seed"_a         = (uint64_t)42,
+             "Relay-BP-S decoder, named as in arXiv:2506.01779: R legs, the first T0 iterations of"
+             " BP with uniform memory gamma0, each later one Tr iterations with per-variable memory"
+             " drawn from [gamma_center - gamma_width/2, gamma_center + gamma_width/2], restarted"
+             " from the priors with the previous posterior relayed as memory. Each shot collects S"
+             " converged solutions (<= 0: every leg) and returns the lowest prior weight; OSD-0 on"
+             " shots that never converge. Defaults are the paper's gross-code values.")
         .def("decode_batch", &RelayBpDecoder::decode_batch, "syndromes"_a,
              "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8 -- whether"
              " any leg converged).");

@@ -573,12 +573,12 @@ relayed across legs. The γ field is generated *on device* each leg by a
 stateless splitmix64 hash of (seed, leg, shot, variable) — no RNG state, no
 host↔device traffic, just one (B × nb) fill per leg.
 
-`leg_max_iter=8` is the adopted default: short legs with frequent γ
+`Tr=8` is the adopted setting: short legs with frequent γ
 re-draws beat long legs on both LER and speed, because the disorder
 re-randomisation — not per-leg BP depth — is what escapes trapping sets.
 At pre=10, legs=10 (8192 shots):
 
-| leg_max_iter | tet n=15 LER / µs·shot⁻¹ | tri n=19 LER / µs·shot⁻¹ |
+| Tr | tet n=15 LER / µs·shot⁻¹ | tri n=19 LER / µs·shot⁻¹ |
 |---|---|---|
 | 30 (paper default) | 0.0146 / 207 | 0.1885 / 241 |
 | 8 (adopted) | **0.0110 / 67** | 0.1819 / 78 |
@@ -601,7 +601,7 @@ property of the γ-distribution config, mirrored by nv).
 \* 5 000 shots; CI overlaps the others.
 
 **Decode time, total excl. sampling, µs/shot** (stim-bar totals, relay at
-the tuned `leg_max_iter=8`):
+the tuned `Tr=8`):
 
 | code | kokkos:bp_osd | kokkos:relay_bp | nv:bp_osd | nv:relay_bp | ldpc:bp_osd |
 |---|---|---|---|---|---|
@@ -635,11 +635,11 @@ remains available headroom if relay throughput ever matters more than this.
   pairs in 72 columns) no deterministic rule reproduces ldpc's
   rounding-noise order, and adding 1e-13 of noise to ldpc's own posteriors
   moves it as far.
-- **Relay-BP's `stop_nconv` is per shot** — the number of converged
-  solutions to collect before returning the lowest-weight one — not a batch
-  early-stop. Collecting five instead of one halves the LER on tetrahedral
-  n=15 (0.00125 → 0.00060), and memory in the pre-phase (`gamma0=0.1`) takes
-  the rest of the way to the reference implementation.
+- **Relay-BP's `S` is per shot** — the number of converged solutions to
+  collect before returning the lowest-weight one — not a batch early-stop.
+  Collecting five instead of one halves the LER on tetrahedral n=15
+  (0.00125 → 0.00060), and memory in the first leg (`gamma0=0.1`) takes the
+  rest of the way to the reference implementation.
 - **nv-qldpc needs `use_osd=True`** — `osd_method` alone is silently inert.
 - **Binding design is a pipeline stage.** nanobind zero-copy views +
   capsule-owned outputs make translate ≈ 0; per-shot result objects make it
