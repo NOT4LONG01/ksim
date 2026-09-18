@@ -143,8 +143,7 @@ BpResult bp_osd0_decode_batch(
 {
     upload_syndromes(syndromes, B, ws);
     bp_run(et, B, max_bp_iter, ws);
-    osd0_run_all(B, et.num_checks, et.num_bits, H_dev, ws, osd_ws);
-    Kokkos::deep_copy(ws.conv, (uint8_t)1);
+    osd0_run_all(B, et.num_checks, et.num_bits, H_dev, et.channel_llr, ws, osd_ws);
     return download_result(B, et.num_bits, ws);
 }
 

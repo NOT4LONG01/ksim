@@ -48,6 +48,9 @@ BpWorkspace::BpWorkspace(int B_, int nc_, int nb_, int E_)
     sign_cnt   = Kokkos::View<float**,   DeviceSpace>("sign_cnt",  B_, nc_);
     pred       = Kokkos::View<uint8_t**, DeviceSpace>("pred",      B_, nb_);
     conv       = Kokkos::View<uint8_t*,  DeviceSpace>("conv",      B_);
+    best_pred  = Kokkos::View<uint8_t**, DeviceSpace>("best_pred", B_, nb_);
+    best_w     = Kokkos::View<float*,    DeviceSpace>("best_w",    B_);
+    nconv      = Kokkos::View<int*,      DeviceSpace>("nconv",     B_);
     row_par    = Kokkos::View<unsigned int**, DeviceSpace>("row_par",   B_, nc_);
 }
 
@@ -109,9 +112,24 @@ BpResult download_result(int B, int nb, BpWorkspace& ws) {
 // most-likely-error independent set (OSD-0 à la Roffe et al.).  Rows are
 // bit-packed into 64-bit words; elimination is team-parallel over rows with
 // word-wide XOR.
+//
+// The order among tied posteriors decides the pivot set, and BP leaves many
+// exact ties on a non-converged shot (symmetric bits far from the syndrome).
+// Ties go to the likelier channel prior, then the lower column index; the
+// quantisation keeps that rule stable under float32 atomic summation noise.
+KOKKOS_INLINE_FUNCTION bool osd_col_before(float ta, float la, int ia,
+                                           float tb, float lb, int ib) {
+    float qa = Kokkos::floor(ta / OSD_TIE_TOL);
+    float qb = Kokkos::floor(tb / OSD_TIE_TOL);
+    if (qa != qb) return qa < qb;
+    if (la != lb) return la < lb;
+    return ia < ib;
+}
+
 void osd0_run_all(
     int B, int nc, int nb,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_d,
+    const Kokkos::View<float*, DeviceSpace>& channel_llr,
     BpWorkspace& ws,
     OsdWorkspace& osd_ws)
 {
@@ -124,6 +142,7 @@ void osd0_run_all(
     if (nc_host.empty()) return;
 
     auto tlr    = ws.total_llr;
+    auto ch_llr = channel_llr;
     auto syn_u  = ws.syndrome_u;
     auto pred   = ws.pred;
     auto Hw     = osd_ws.Hw;
@@ -165,17 +184,20 @@ void osd0_run_all(
             });
             tm.team_barrier();
 
-            // Bitonic sort of perm by signed LLR ascending; -1 padding → tail.
+            // Bitonic sort of perm by osd_col_before; -1 padding → tail.
             for (int k = 2; k <= n2; k <<= 1) {
                 for (int half = k >> 1; half > 0; half >>= 1) {
                     Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n2), [&](int idx) {
                         int l = idx ^ half;
                         if (l > idx) {
                             int pa = perm(i, idx), pb = perm(i, l);
-                            float ka = (pa < 0) ? FLT_MAX : tlr(s, pa);
-                            float kb = (pb < 0) ? FLT_MAX : tlr(s, pb);
+                            bool a_after_b;
+                            if (pa < 0)      a_after_b = (pb >= 0);
+                            else if (pb < 0) a_after_b = false;
+                            else a_after_b = osd_col_before(tlr(s, pb), ch_llr(pb), pb,
+                                                            tlr(s, pa), ch_llr(pa), pa);
                             bool up = ((idx & k) == 0);
-                            if ((ka > kb) == up) {
+                            if (a_after_b == up) {
                                 perm(i, idx) = pb;
                                 perm(i, l)   = pa;
                             }

@@ -624,7 +624,22 @@ remains available headroom if relay throughput ever matters more than this.
 - **Never use sub-word types for contended Kokkos/CUDA atomics.** uint8
   atomics fall back to desul CAS/lock emulation; one flag view cost 200×.
 - **OSD column order is the whole algorithm**: sort by signed posterior
-  LLR ascending (most-likely-error first), not by reliability magnitude.
+  LLR ascending (most-likely-error first), not by reliability magnitude. And
+  the order *among tied posteriors* is part of it: on a small code most
+  pivots come from ties, and with degenerate mechanisms (two columns
+  composing to a third with a different observable) the tie order is the
+  logical outcome. Ties go to the likelier prior, then the lower column
+  index, after quantising posteriors to `OSD_TIE_TOL` so float atomics
+  cannot reorder them — deterministic output, equal LER to ldpc on
+  tetrahedral n=15 and triangular n=19; on triangular n=7 (156 degenerate
+  pairs in 72 columns) no deterministic rule reproduces ldpc's
+  rounding-noise order, and adding 1e-13 of noise to ldpc's own posteriors
+  moves it as far.
+- **Relay-BP's `stop_nconv` is per shot** — the number of converged
+  solutions to collect before returning the lowest-weight one — not a batch
+  early-stop. Collecting five instead of one halves the LER on tetrahedral
+  n=15 (0.00125 → 0.00060), and memory in the pre-phase (`gamma0=0.1`) takes
+  the rest of the way to the reference implementation.
 - **nv-qldpc needs `use_osd=True`** — `osd_method` alone is silently inert.
 - **Binding design is a pipeline stage.** nanobind zero-copy views +
   capsule-owned outputs make translate ≈ 0; per-shot result objects make it

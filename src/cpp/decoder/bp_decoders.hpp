@@ -54,6 +54,11 @@ struct BpWorkspace {
     Kokkos::View<float**,   DeviceSpace> sign_cnt;
     Kokkos::View<uint8_t**, DeviceSpace> pred;
     Kokkos::View<uint8_t*,  DeviceSpace> conv;
+    // Relay-BP ensemble state: the lowest-prior-weight converged solution seen so
+    // far, its weight, and how many converged solutions the shot has produced.
+    Kokkos::View<uint8_t**, DeviceSpace> best_pred;
+    Kokkos::View<float*,    DeviceSpace> best_w;
+    Kokkos::View<int*,      DeviceSpace> nconv;
     // 32-bit (not uint8) so check_parity's atomic XOR uses native hardware
     // atomics; sub-word atomics fall back to CAS/lock emulation and serialize
     // badly on high-weight rows.
@@ -86,9 +91,15 @@ void upload_syndromes(const std::vector<uint8_t>& syn_host, int B, BpWorkspace& 
 BpResult download_result(int B, int nb, BpWorkspace& ws);
 
 // OSD-0 on non-converged shots, in sub-batches of osd_ws.osd_max_batch.
+// Columns are ordered by posterior LLR ascending; posteriors within OSD_TIE_TOL
+// of each other are ordered by channel LLR ascending (likelier error first),
+// then by column index, so the pivot set does not depend on float summation
+// order.  Leaves ws.conv untouched: it still reports whether BP converged.
+static constexpr float OSD_TIE_TOL = 1e-3f;
 void osd0_run_all(
     int B, int nc, int nb,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_d,
+    const Kokkos::View<float*, DeviceSpace>& channel_llr,
     BpWorkspace& ws,
     OsdWorkspace& osd_ws);
 
@@ -130,17 +141,23 @@ void bp_run_memory(
     BpWorkspace& ws);
 
 struct RelayConfig {
-    int   pre_iter      = 80;     // standard BP legs before relay starts
+    int   pre_iter      = 80;     // BP iterations before the relay legs
     int   num_legs      = 100;    // number of memory-BP legs
     int   leg_max_iter  = 60;     // iterations per relay leg
-    float gamma_min     = -0.24f; // gamma ~ Uniform[gamma_min, gamma_max]
+    float gamma_min     = -0.24f; // leg gamma ~ Uniform[gamma_min, gamma_max]
     float gamma_max     =  0.66f;
-    int   stop_nconv    = 2;      // stop early if fewer than this many non-converged
+    float gamma0        = 0.0f;   // uniform memory strength during pre_iter (0 = plain BP)
+    int   stop_nconv    = 1;      // converged solutions to collect per shot; <= 0 runs every leg
     uint64_t seed       = 42;
 };
 
-// Relay BP: pre_iter standard BP + num_legs memory-BP legs with random gamma.
-// OSD-0 fallback on any remaining non-converged shots after all legs.
+// Relay BP (arXiv:2506.01779): pre_iter iterations of BP (memory gamma0 if
+// non-zero), then num_legs legs of disordered-memory BP.  Every leg restarts the
+// messages from the channel priors and keeps only the previous posterior as its
+// memory (the relay).  A shot keeps decoding until it has produced stop_nconv
+// converged solutions and returns the one of lowest prior weight (Relay-BP-S);
+// a shot that never converges falls back to OSD-0.  converged reports whether
+// any leg converged.
 BpResult relay_bp_decode_batch(
     const EdgeTable& et,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_dev,

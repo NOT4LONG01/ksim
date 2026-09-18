@@ -51,6 +51,22 @@ cmake --install build
 pip install -e .
 ```
 
+On the scheduler-free two-GPU box (hostname `gpu`) the same build is already
+configured in `build/` against `~/kokkos/install` (Kokkos 5.x, CUDA 13.2 at
+`/usr/local/cuda`) with the shim at `~/.local/opt/bin/nvcc_wrapper_shim`.
+Python's headers there are a locally extracted `python3.12-dev` whose
+`pyconfig.h` forwards to a multiarch header, so a rebuild needs three
+variables the CMake cache does not carry:
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH \
+       CPLUS_INCLUDE_PATH=$HOME/.local/opt/usr/include \
+       LIBRARY_PATH=$HOME/.local/opt/usr/lib/x86_64-linux-gnu
+cmake --build build -j32 && cmake --install build
+```
+
+Without them `nanobind-static` fails on `x86_64-linux-gnu/python3.12/pyconfig.h`.
+
 **`nvcc_wrapper_shim`** (`/usr/local/bin/nvcc_wrapper_shim`) is not in the repo
 and has vanished from containers before. If the build fails with make
 `Error 127` or `nvcc fatal : 's': expected a number`, recreate it as a bash

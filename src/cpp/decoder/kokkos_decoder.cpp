@@ -142,8 +142,9 @@ struct RelayBpDecoder {
         int leg_max_iter = 60,
         float gamma_min  = -0.24f,
         float gamma_max  =  0.66f,
-        int stop_nconv   = 2,
-        uint64_t seed    = 42)
+        int stop_nconv   = 1,
+        uint64_t seed    = 42,
+        float gamma0     = 0.0f)
         : max_batch_(max_batch)
     {
         ensure_kokkos();
@@ -152,7 +153,14 @@ struct RelayBpDecoder {
         int osd_b = osd_chunk_size(max_batch, et.num_checks, et.num_bits);
         osd_ws = asy::OsdWorkspace(osd_b, et.num_checks, et.num_bits, max_batch);
         H_dev  = asy::build_H_dense(et);
-        cfg    = { pre_iter, num_legs, leg_max_iter, gamma_min, gamma_max, stop_nconv, seed };
+        cfg.pre_iter     = pre_iter;
+        cfg.num_legs     = num_legs;
+        cfg.leg_max_iter = leg_max_iter;
+        cfg.gamma_min    = gamma_min;
+        cfg.gamma_max    = gamma_max;
+        cfg.gamma0       = gamma0;
+        cfg.stop_nconv   = stop_nconv;
+        cfg.seed         = seed;
     }
 
     nb::tuple decode_batch(nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig> syn_arr) {
@@ -246,13 +254,14 @@ NB_MODULE(kokkos_decoder, m) {
              "H"_a, "priors"_a, "max_iter"_a = 30, "max_batch"_a = 4096,
              "BP + OSD-0 decoder (Kokkos/CUDA). H: (nc,nb) uint8, priors: (nb,) float32.")
         .def("decode_batch", &BpOsd0Decoder::decode_batch, "syndromes"_a,
-             "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8).");
+             "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8 -- whether BP"
+             " converged; OSD-0 supplied the prediction where it did not).");
 
     nb::class_<RelayBpDecoder>(m, "RelayBpDecoder")
         .def(nb::init<
                 nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig>,
                 nb::ndarray<float,   nb::ndim<1>, nb::c_contig>,
-                int, int, int, int, float, float, int, uint64_t>(),
+                int, int, int, int, float, float, int, uint64_t, float>(),
              "H"_a, "priors"_a,
              "max_batch"_a   = 4096,
              "pre_iter"_a    = 80,
@@ -260,12 +269,17 @@ NB_MODULE(kokkos_decoder, m) {
              "leg_max_iter"_a = 60,
              "gamma_min"_a   = -0.24f,
              "gamma_max"_a   =  0.66f,
-             "stop_nconv"_a  = 2,
+             "stop_nconv"_a  = 1,
              "seed"_a        = (uint64_t)42,
-             "Relay BP decoder: pre_iter standard BP + num_legs memory-BP legs with random gamma."
-             " OSD-0 fallback on remaining non-converged shots.")
+             "gamma0"_a      = 0.0f,
+             "Relay BP decoder (arXiv:2506.01779): pre_iter BP iterations (memory gamma0 if"
+             " non-zero), then num_legs disordered-memory legs restarted from the priors with the"
+             " previous posterior relayed as memory. Each shot collects stop_nconv converged"
+             " solutions (<= 0: every leg) and returns the lowest prior weight; OSD-0 on shots that"
+             " never converge.")
         .def("decode_batch", &RelayBpDecoder::decode_batch, "syndromes"_a,
-             "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8).");
+             "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8 -- whether"
+             " any leg converged).");
 
     nb::class_<BpLsdDecoder>(m, "BpLsdDecoder")
         .def(nb::init<

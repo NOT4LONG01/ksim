@@ -140,6 +140,27 @@ KOKKOS_INLINE_FUNCTION uint64_t splitmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+// A shot is done once it holds stop_nconv converged solutions (never, if <= 0).
+KOKKOS_INLINE_FUNCTION bool relay_done(int nconv, int stop) {
+    return stop > 0 && nconv >= stop;
+}
+
+// Record the converged shots' solutions: keep the lowest prior weight seen.
+static void relay_record(int B, int nb, const EdgeTable& et, int stop, BpWorkspace& ws) {
+    auto conv = ws.conv;  auto nconv = ws.nconv;  auto pred = ws.pred;
+    auto best = ws.best_pred;  auto best_w = ws.best_w;  auto ch = et.channel_llr;
+    Kokkos::parallel_for("relay_record", B, KOKKOS_LAMBDA(int s) {
+        if (!conv(s) || relay_done(nconv(s), stop)) return;
+        float w = 0.0f;
+        for (int j = 0; j < nb; ++j) if (pred(s, j)) w += ch(j);
+        if (nconv(s) == 0 || w < best_w(s)) {
+            best_w(s) = w;
+            for (int j = 0; j < nb; ++j) best(s, j) = pred(s, j);
+        }
+        nconv(s) += 1;
+    });
+}
+
 BpResult relay_bp_decode_batch(
     const EdgeTable& et,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_dev,
@@ -151,32 +172,50 @@ BpResult relay_bp_decode_batch(
 {
     upload_syndromes(syndromes, B, ws);
 
-    // Phase 1: standard BP
-    bp_run(et, B, cfg.pre_iter, ws);
-
-    // Check if all converged after standard BP
-    int num_nc = 0;
-    Kokkos::parallel_reduce("relay_check_pre", B,
-        KOKKOS_LAMBDA(int s, int& acc) { if (!ws.conv(s)) ++acc; },
-        num_nc);
-    if (num_nc == 0) {
-        Kokkos::deep_copy(ws.conv, (uint8_t)1);
-        return download_result(B, et.num_bits, ws);
-    }
-
-    // Phase 2: relay legs — disordered memory BP, gamma(s,j) re-drawn per leg.
-    // Posteriors from the previous phase seed tlr_old (the "relay").
+    const int nb = et.num_bits, E = et.num_edges;
+    const int stop = cfg.stop_nconv;
     auto pair_B  = Kokkos::make_pair(0, B);
     auto tlr_sub = Kokkos::subview(ws.total_llr, pair_B, Kokkos::ALL());
     auto old_sub = Kokkos::subview(ws.tlr_old,   pair_B, Kokkos::ALL());
-    Kokkos::deep_copy(old_sub, tlr_sub);
+    auto gam_sub = Kokkos::subview(ws.gamma,     pair_B, Kokkos::ALL());
+    auto nconv_sub = Kokkos::subview(ws.nconv,   pair_B);
+    Kokkos::deep_copy(nconv_sub, 0);
 
-    const int nb = et.num_bits;
+    auto ch_llr = et.channel_llr;
+    auto col    = et.edge_col;
+    auto v2c    = ws.v2c;
+    auto c2v    = ws.c2v;
+    auto conv   = ws.conv;
+    auto nconv  = ws.nconv;
+    auto tlr_old = ws.tlr_old;
+
+    // Phase 1: pre_iter iterations of BP, with uniform memory gamma0 if asked for.
+    if (cfg.gamma0 != 0.0f) {
+        bp_run(et, B, 0, ws);   // messages from the priors, conv cleared
+        Kokkos::deep_copy(gam_sub, cfg.gamma0);
+        Kokkos::parallel_for("relay_pre_memory",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
+            KOKKOS_LAMBDA(int s, int j) { tlr_old(s,j) = ch_llr(j); });
+        bp_run_memory(et, B, cfg.pre_iter, ws);
+    } else {
+        bp_run(et, B, cfg.pre_iter, ws);
+    }
+    relay_record(B, nb, et, stop, ws);
+
+    // Phase 2: relay legs.  Each leg restarts the messages from the priors and
+    // keeps only the previous posterior, blended in through a fresh gamma field.
+    Kokkos::deep_copy(old_sub, tlr_sub);
     auto gam = ws.gamma;
     const uint64_t seed = cfg.seed ^ 0xdeadbeefcafeULL;
     const float gmin = cfg.gamma_min, grange = cfg.gamma_max - cfg.gamma_min;
 
     for (int leg = 0; leg < cfg.num_legs; ++leg) {
+        int active = 0;
+        Kokkos::parallel_reduce("relay_active", B,
+            KOKKOS_LAMBDA(int s, int& acc) { if (!relay_done(nconv(s), stop)) ++acc; },
+            active);
+        if (active == 0) break;
+
         Kokkos::parallel_for("relay_gamma",
             Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
             KOKKOS_LAMBDA(int s, int j) {
@@ -187,21 +226,31 @@ BpResult relay_bp_decode_batch(
                 float u = (float)(h >> 40) * (1.0f / 16777216.0f);
                 gam(s,j) = gmin + u * grange;
             });
+        Kokkos::parallel_for("relay_leg_messages",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,E}),
+            KOKKOS_LAMBDA(int s, int e) {
+                if (relay_done(nconv(s), stop)) return;
+                v2c(s,e) = ch_llr(col(e));
+                c2v(s,e) = 0.0f;
+            });
+        Kokkos::parallel_for("relay_leg_reopen", B,
+            KOKKOS_LAMBDA(int s) { if (!relay_done(nconv(s), stop)) conv(s) = 0; });
 
         bp_run_memory(et, B, cfg.leg_max_iter, ws);
-
-        // Count non-converged
-        num_nc = 0;
-        Kokkos::parallel_reduce("relay_leg_nc", B,
-            KOKKOS_LAMBDA(int s, int& acc) { if (!ws.conv(s)) ++acc; },
-            num_nc);
-        if (num_nc < cfg.stop_nconv) break;
+        relay_record(B, nb, et, stop, ws);
     }
 
-    // Phase 3: OSD-0 fallback for remaining non-converged shots
-    osd0_run_all(B, et.num_checks, et.num_bits, H_dev, ws, osd_ws);
-    Kokkos::deep_copy(ws.conv, (uint8_t)1);
-    return download_result(B, et.num_bits, ws);
+    // Phase 3: shots with a converged solution return their best one; the rest
+    // go to OSD-0 on the last leg's posteriors.  converged = any leg converged.
+    auto pred = ws.pred;  auto best = ws.best_pred;
+    Kokkos::parallel_for("relay_best",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
+        KOKKOS_LAMBDA(int s, int j) { if (nconv(s) > 0) pred(s,j) = best(s,j); });
+    Kokkos::parallel_for("relay_conv", B,
+        KOKKOS_LAMBDA(int s) { conv(s) = (nconv(s) > 0) ? 1 : 0; });
+    Kokkos::fence();
+    osd0_run_all(B, et.num_checks, nb, H_dev, et.channel_llr, ws, osd_ws);
+    return download_result(B, nb, ws);
 }
 
 } // namespace asy

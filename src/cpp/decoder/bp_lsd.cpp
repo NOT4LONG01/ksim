@@ -238,10 +238,8 @@ BpResult bp_lsd_decode_batch(
         KOKKOS_LAMBDA(int s, int& acc) { if (!ws.conv(s)) ++acc; },
         num_nc);
 
-    if (num_nc == 0) {
-        Kokkos::deep_copy(ws.conv, (uint8_t)1);
+    if (num_nc == 0)
         return download_result(B, et.num_bits, ws);
-    }
 
     // Download workspace for non-converged shots
     auto pred_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, ws.pred);
@@ -307,7 +305,6 @@ BpResult bp_lsd_decode_batch(
             pred_upload(s, j) = lsd_corrections[s * nb + j];
     }
     Kokkos::deep_copy(ws.pred, pred_upload);
-    Kokkos::deep_copy(ws.conv, (uint8_t)1);
     Kokkos::fence();
 
     return download_result(B, et.num_bits, ws);

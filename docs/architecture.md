@@ -206,18 +206,38 @@ dec = BpOsd0Decoder(H_dense_uint8, priors_float32, max_iter=30, max_batch=4096)
 preds, converged = dec.decode_batch(syndromes_uint8)  # (B,nb), (B,)
 ```
 
-`H` must be a dense `np.ndarray`, uint8, shape `(nc, nb)`.
+`H` must be a dense `np.ndarray`, uint8, shape `(nc, nb)`. `converged` is
+BP's own verdict per shot: where it is 0, OSD-0 (or LSD, or a relay's best
+leg for `RelayBpDecoder`) supplied the prediction.
 
 - `BpOsd0Decoder`: product-sum BP; non-converged shots get OSD-0 (bit-packed
   team-parallel Gauss–Jordan, columns sorted by signed posterior LLR ascending
-  — most-likely-error first; predictions are bit-identical to
-  `ldpc.BpOsdDecoder`).
-- `RelayBpDecoder`: `pre_iter` standard BP, then `num_legs` disordered-memory
-  legs (Relay-BP: per-(shot, variable) γ ~ U[gamma_min, gamma_max], re-drawn
-  each leg via on-device splitmix64 hash, applied as a prior↔posterior blend),
-  OSD-0 fallback on the rest. **Short legs win**: `leg_max_iter ≈ 8` with 10–20
-  legs beats `leg_max_iter = 30` on both LER and speed — the γ re-randomisation,
-  not BP depth, is what escapes trapping sets.
+  — most-likely-error first). Posteriors within `OSD_TIE_TOL = 1e-3` of each
+  other are ordered by channel LLR ascending, then column index, which makes
+  the output identical run to run despite the float atomics in the message
+  sums. Predictions match `ldpc.BpOsdDecoder` on every shot where BP converges
+  and on the OSD-0 shots up to that tie order (99.98 % of shots on triangular
+  n=19, equal LER on tetrahedral n=15). Where a model has degenerate
+  mechanisms — three columns on three detectors, any two composing to the
+  third with a different observable, 156 such pairs in the triangular n=7
+  graphlike model — OSD-0's choice among their tied posteriors decides the
+  logical outcome, and ldpc's stable sort of its double-rounding noise picks
+  differently from any deterministic rule; that is a property of OSD-0 on a
+  tiny code, not a difference in the BP.
+- `RelayBpDecoder` (arXiv:2506.01779): `pre_iter` iterations of BP (memory
+  `gamma0` if non-zero), then `num_legs` disordered-memory legs
+  (per-(shot, variable) γ ~ U[gamma_min, gamma_max], re-drawn each leg via
+  on-device splitmix64 hash, applied as a prior↔posterior blend). Each leg
+  restarts the messages from the priors and keeps only the previous posterior
+  as memory — the relay. A shot decodes until it has produced `stop_nconv`
+  converged solutions and returns the one of lowest prior weight (5 is the
+  paper's Relay-BP-S; `<= 0` runs every leg); shots that never converge fall
+  back to OSD-0. **Short legs win**: `leg_max_iter ≈ 8` with 10–20 legs beats
+  `leg_max_iter = 30` on both LER and speed — the γ re-randomisation, not BP
+  depth, is what escapes trapping sets. With the reference's own settings
+  (`gamma0=0.1, num_legs=300, leg_max_iter=60, stop_nconv=5`) it lands on the
+  reference implementation's LER (tetrahedral n=15, p=5e-3, 20 000 shots:
+  4.5e-4 vs 4.0e-4), where `stop_nconv=1` plain-BP pre-phase gives 1.25e-3.
 - `BpLsdDecoder`: GPU BP runs in batch; non-converged shots fall through to CPU
   cluster BFS + brute force (≤ `max_cluster_bits`) or OSD-0. The hybrid keeps
   mean throughput fast while improving accuracy on hard instances.
