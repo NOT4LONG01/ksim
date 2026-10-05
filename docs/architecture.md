@@ -247,6 +247,20 @@ leg for `RelayBpDecoder`) supplied the prediction.
   reference implementation's settings (`gamma0=0.1, R=301, Tr=60, S=5`) it
   lands on that implementation's LER (tetrahedral n=15, p=5e-3, 20 000 shots:
   4.5e-4 vs 4.0e-4), where `S=1` with a plain-BP first leg gives 1.25e-3.
+  The later legs' γ is keyed by a shot's place in its batch, so a shot's
+  prediction depends on how the shots were batched, not on `seed` alone.
+  `decode_batch_with_stats` runs the same decode and adds, per shot and in the
+  paper's terms: `solutions` (converged solutions collected, at most `S`),
+  `legs` (legs run before the shot held `S`; `R` if never), `first_leg` (leg of
+  the first converged solution, −1 if none), `weight` (prior weight of the
+  returned solution; +inf where OSD-0 answered) and `rival_weight` (the lowest
+  weight among converged solutions of a logical class other than the returned
+  one's; +inf if none). The class needs the observables, passed at
+  construction as `obs` (uint8, `(num_obs, nb)`, at most 32 observables);
+  without them `rival_weight` stays +inf. `rival_weight − weight` is a
+  complementary gap the ensemble finds without a second decode: on tetrahedral
+  n=15 at p=1e-2 with `R=301, S=5`, 5 % of shots hold a rival and those fail
+  32 % of the time against 0.6 % for the rest. None of it changes the decode.
 - `BpLsdDecoder`: GPU BP runs in batch; non-converged shots fall through to CPU
   cluster BFS + brute force (≤ `max_cluster_bits`) or OSD-0. The hybrid keeps
   mean throughput fast while improving accuracy on hard instances.

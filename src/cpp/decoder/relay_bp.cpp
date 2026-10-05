@@ -2,6 +2,7 @@
 #include <Kokkos_Core.hpp>
 #include <cstdint>
 #include <cmath>
+#include <limits>
 
 namespace asy {
 
@@ -146,20 +147,61 @@ KOKKOS_INLINE_FUNCTION bool relay_done(int nconv, int stop) {
     return stop > 0 && nconv >= stop;
 }
 
-// Record the converged shots' solutions: keep the lowest prior weight seen.
-static void relay_record(int B, int nb, const EdgeTable& et, int stop, BpWorkspace& ws) {
+constexpr float RELAY_NONE = 3.402823466e+38f;   // "no such solution yet"
+
+// Record the converged shots' solutions: keep the lowest prior weight seen and,
+// when the observables are known, the lowest weight among solutions of any
+// class other than the best's -- the old best whenever a lighter solution of a
+// new class displaces it, since it was the lightest of everything before.
+static void relay_record(int B, int nb, const EdgeTable& et, int stop, BpWorkspace& ws,
+                         const ObsTable* obs, int leg) {
     auto conv = ws.conv;  auto nconv = ws.nconv;  auto pred = ws.pred;
     auto best = ws.best_pred;  auto best_w = ws.best_w;  auto ch = et.channel_llr;
+    auto best_cls = ws.best_cls;  auto rival_w = ws.rival_w;
+    auto first_leg = ws.first_leg;  auto legs_done = ws.legs_done;
+    const int nnz = obs ? obs->nnz : 0;
+    Kokkos::View<int*, DeviceSpace> orow, ocol;
+    if (nnz > 0) { orow = obs->row; ocol = obs->col; }
     Kokkos::parallel_for("relay_record", B, KOKKOS_LAMBDA(int s) {
         if (!conv(s) || relay_done(nconv(s), stop)) return;
         float w = 0.0f;
         for (int j = 0; j < nb; ++j) if (pred(s, j)) w += ch(j);
-        if (nconv(s) == 0 || w < best_w(s)) {
-            best_w(s) = w;
+        uint32_t c = 0u;
+        for (int k = 0; k < nnz; ++k) if (pred(s, ocol(k))) c ^= (1u << orow(k));
+        bool take = false;
+        if (nconv(s) == 0) {
+            take = true;  first_leg(s) = leg;
+        } else if (c == best_cls(s)) {
+            take = w < best_w(s);
+        } else if (w < best_w(s)) {
+            rival_w(s) = best_w(s);  take = true;
+        } else if (w < rival_w(s)) {
+            rival_w(s) = w;
+        }
+        if (take) {
+            best_w(s) = w;  best_cls(s) = c;
             for (int j = 0; j < nb; ++j) best(s, j) = pred(s, j);
         }
         nconv(s) += 1;
+        if (relay_done(nconv(s), stop)) legs_done(s) = leg + 1;
     });
+}
+
+static void download_stats(int B, BpWorkspace& ws, RelayStats& out) {
+    auto pair_B = Kokkos::make_pair(0, B);
+    auto nconv = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kokkos::subview(ws.nconv, pair_B));
+    auto legs  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kokkos::subview(ws.legs_done, pair_B));
+    auto first = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kokkos::subview(ws.first_leg, pair_B));
+    auto bw    = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kokkos::subview(ws.best_w, pair_B));
+    auto rw    = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kokkos::subview(ws.rival_w, pair_B));
+    const float inf = std::numeric_limits<float>::infinity();
+    out.solutions.resize(B); out.legs.resize(B); out.first_leg.resize(B);
+    out.weight.resize(B); out.rival_weight.resize(B);
+    for (int s = 0; s < B; ++s) {
+        out.solutions[s] = nconv(s);  out.legs[s] = legs(s);  out.first_leg[s] = first(s);
+        out.weight[s]       = nconv(s) > 0 ? bw(s) : inf;
+        out.rival_weight[s] = rw(s) >= RELAY_NONE ? inf : rw(s);
+    }
 }
 
 BpResult relay_bp_decode_batch(
@@ -169,7 +211,9 @@ BpResult relay_bp_decode_batch(
     int B,
     const RelayConfig& cfg,
     BpWorkspace& ws,
-    OsdWorkspace& osd_ws)
+    OsdWorkspace& osd_ws,
+    const ObsTable* obs,
+    RelayStats* stats)
 {
     upload_syndromes(syndromes, B, ws);
 
@@ -181,6 +225,11 @@ BpResult relay_bp_decode_batch(
     auto gam_sub = Kokkos::subview(ws.gamma,     pair_B, Kokkos::ALL());
     auto nconv_sub = Kokkos::subview(ws.nconv,   pair_B);
     Kokkos::deep_copy(nconv_sub, 0);
+    Kokkos::deep_copy(Kokkos::subview(ws.rival_w,   pair_B), RELAY_NONE);
+    Kokkos::deep_copy(Kokkos::subview(ws.best_cls,  pair_B), 0u);
+    Kokkos::deep_copy(Kokkos::subview(ws.first_leg, pair_B), -1);
+    // a shot that never holds S solutions runs every leg the batch runs
+    Kokkos::deep_copy(Kokkos::subview(ws.legs_done, pair_B), cfg.R);
 
     auto ch_llr = et.channel_llr;
     auto col    = et.edge_col;
@@ -201,7 +250,7 @@ BpResult relay_bp_decode_batch(
     } else {
         bp_run(et, B, cfg.T0, ws);
     }
-    relay_record(B, nb, et, stop, ws);
+    relay_record(B, nb, et, stop, ws, obs, 0);
 
     // Legs 1..R-1.  Each leg restarts the messages from the priors and keeps
     // only the previous posterior, blended in through a fresh gamma field.
@@ -238,7 +287,7 @@ BpResult relay_bp_decode_batch(
             KOKKOS_LAMBDA(int s) { if (!relay_done(nconv(s), stop)) conv(s) = 0; });
 
         bp_run_memory(et, B, cfg.Tr, ws);
-        relay_record(B, nb, et, stop, ws);
+        relay_record(B, nb, et, stop, ws, obs, leg);
     }
 
     // Shots with a converged solution return their best one; the rest
@@ -250,6 +299,7 @@ BpResult relay_bp_decode_batch(
     Kokkos::parallel_for("relay_conv", B,
         KOKKOS_LAMBDA(int s) { conv(s) = (nconv(s) > 0) ? 1 : 0; });
     Kokkos::fence();
+    if (stats) download_stats(B, ws, *stats);
     osd0_run_all(B, et.num_checks, nb, H_dev, et.channel_llr, ws, osd_ws);
     return download_result(B, nb, ws);
 }

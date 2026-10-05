@@ -51,6 +51,10 @@ BpWorkspace::BpWorkspace(int B_, int nc_, int nb_, int E_)
     best_pred  = Kokkos::View<uint8_t**, DeviceSpace>("best_pred", B_, nb_);
     best_w     = Kokkos::View<float*,    DeviceSpace>("best_w",    B_);
     nconv      = Kokkos::View<int*,      DeviceSpace>("nconv",     B_);
+    best_cls   = Kokkos::View<uint32_t*, DeviceSpace>("best_cls",  B_);
+    rival_w    = Kokkos::View<float*,    DeviceSpace>("rival_w",   B_);
+    first_leg  = Kokkos::View<int*,      DeviceSpace>("first_leg", B_);
+    legs_done  = Kokkos::View<int*,      DeviceSpace>("legs_done", B_);
     row_par    = Kokkos::View<unsigned int**, DeviceSpace>("row_par",   B_, nc_);
 }
 

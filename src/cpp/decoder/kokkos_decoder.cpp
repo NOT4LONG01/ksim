@@ -2,6 +2,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/optional.h>
 
 #include "bp_decoders.hpp"
 
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <vector>
 #include <cstdint>
+#include <optional>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -83,6 +85,39 @@ vec_to_ndarray_i32(std::vector<int32_t> data, int B, int nb) {
     return nb::ndarray<nb::numpy, int32_t, nb::ndim<2>>(buf, {(size_t)B, (size_t)nb}, cap);
 }
 
+// Convert a (B,) vector of int32 or float to a numpy array via heap-owned buffer.
+template <typename T>
+nb::ndarray<nb::numpy, T, nb::ndim<1>> vec1_to_ndarray_t(std::vector<T> data) {
+    auto* buf = new T[data.size()];
+    std::copy(data.begin(), data.end(), buf);
+    auto cap = nb::capsule(buf, [](void* p) noexcept { delete[] static_cast<T*>(p); });
+    return nb::ndarray<nb::numpy, T, nb::ndim<1>>(buf, {data.size()}, cap);
+}
+
+// The observables matrix (num_obs × nb, uint8) as a device-side sparse list.
+asy::ObsTable obs_table_from_numpy(nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig> L, int nb_bits) {
+    int no = (int)L.shape(0);
+    if ((int)L.shape(1) != nb_bits) throw std::invalid_argument("obs columns != num_bits");
+    if (no > 32) throw std::invalid_argument("at most 32 observables are supported");
+    std::vector<int> r, c;
+    const uint8_t* Lp = L.data();
+    for (int i = 0; i < no; ++i)
+        for (int j = 0; j < nb_bits; ++j)
+            if (Lp[(size_t)i * nb_bits + j]) { r.push_back(i); c.push_back(j); }
+    asy::ObsTable t;
+    t.nnz = (int)r.size();
+    t.row = Kokkos::View<int*, DeviceSpace>("obs_row", std::max(1, t.nnz));
+    t.col = Kokkos::View<int*, DeviceSpace>("obs_col", std::max(1, t.nnz));
+    if (t.nnz) {
+        auto rh = Kokkos::create_mirror_view(t.row);
+        auto ch = Kokkos::create_mirror_view(t.col);
+        for (int k = 0; k < t.nnz; ++k) { rh(k) = r[k]; ch(k) = c[k]; }
+        Kokkos::deep_copy(t.row, rh);
+        Kokkos::deep_copy(t.col, ch);
+    }
+    return t;
+}
+
 // ─── BpOsd0Decoder ────────────────────────────────────────────────────────────
 struct BpOsd0Decoder {
     asy::EdgeTable    et;
@@ -131,6 +166,7 @@ struct RelayBpDecoder {
     asy::OsdWorkspace osd_ws;
     Kokkos::View<uint8_t**, DeviceSpace> H_dev;
     asy::RelayConfig  cfg;
+    asy::ObsTable     obs_;
     int max_batch_;
 
     RelayBpDecoder(
@@ -144,7 +180,8 @@ struct RelayBpDecoder {
         float gamma_center = 0.21f,
         float gamma_width  = 0.90f,
         int S              = 1,
-        uint64_t seed      = 42)
+        uint64_t seed      = 42,
+        std::optional<nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig>> obs = std::nullopt)
         : max_batch_(max_batch)
     {
         ensure_kokkos();
@@ -161,6 +198,7 @@ struct RelayBpDecoder {
         cfg.gamma_width  = gamma_width;
         cfg.S            = S;
         cfg.seed         = seed;
+        if (obs) obs_ = obs_table_from_numpy(*obs, et.num_bits);
     }
 
     nb::tuple decode_batch(nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig> syn_arr) {
@@ -175,6 +213,27 @@ struct RelayBpDecoder {
         return nb::make_tuple(
             vec_to_ndarray(std::move(res.predictions), B, et.num_bits),
             vec1_to_ndarray(std::move(res.converged)));
+    }
+
+    // The same decode, plus each shot's relay statistics (see RelayStats).
+    nb::tuple decode_batch_with_stats(nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig> syn_arr) {
+        int B  = (int)syn_arr.shape(0);
+        int nc = (int)syn_arr.shape(1);
+        if (nc != et.num_checks) throw std::invalid_argument("syndrome columns != num_checks");
+        if (B > max_batch_)     throw std::invalid_argument("batch size exceeds max_batch");
+
+        std::vector<uint8_t> syn(syn_arr.data(), syn_arr.data() + (size_t)B * nc);
+        asy::RelayStats st;
+        auto res = asy::relay_bp_decode_batch(et, H_dev, syn, B, cfg, ws, osd_ws,
+                                              obs_.nnz ? &obs_ : nullptr, &st);
+        return nb::make_tuple(
+            vec_to_ndarray(std::move(res.predictions), B, et.num_bits),
+            vec1_to_ndarray(std::move(res.converged)),
+            vec1_to_ndarray_t<int32_t>(std::move(st.solutions)),
+            vec1_to_ndarray_t<int32_t>(std::move(st.legs)),
+            vec1_to_ndarray_t<int32_t>(std::move(st.first_leg)),
+            vec1_to_ndarray_t<float>(std::move(st.weight)),
+            vec1_to_ndarray_t<float>(std::move(st.rival_weight)));
     }
 };
 
@@ -261,7 +320,8 @@ NB_MODULE(kokkos_decoder, m) {
         .def(nb::init<
                 nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig>,
                 nb::ndarray<float,   nb::ndim<1>, nb::c_contig>,
-                int, int, int, int, float, float, float, int, uint64_t>(),
+                int, int, int, int, float, float, float, int, uint64_t,
+                std::optional<nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig>>>(),
              "H"_a, "priors"_a,
              "max_batch"_a    = 4096,
              "R"_a            = 301,
@@ -272,6 +332,7 @@ NB_MODULE(kokkos_decoder, m) {
              "gamma_width"_a  = 0.90f,
              "S"_a            = 1,
              "seed"_a         = (uint64_t)42,
+             "obs"_a          = nb::none(),
              "Relay-BP-S decoder, named as in arXiv:2506.01779: R legs, the first T0 iterations of"
              " BP with uniform memory gamma0, each later one Tr iterations with per-variable memory"
              " drawn from [gamma_center - gamma_width/2, gamma_center + gamma_width/2], restarted"
@@ -280,7 +341,16 @@ NB_MODULE(kokkos_decoder, m) {
              " shots that never converge. Defaults are the paper's gross-code values.")
         .def("decode_batch", &RelayBpDecoder::decode_batch, "syndromes"_a,
              "Decode batch. Returns (predictions (B,nb) uint8, converged (B,) uint8 -- whether"
-             " any leg converged).");
+             " any leg converged).")
+        .def("decode_batch_with_stats", &RelayBpDecoder::decode_batch_with_stats, "syndromes"_a,
+             "The same decode, plus per-shot relay statistics: (predictions, converged,"
+             " solutions (B,) int32 -- converged solutions collected, legs (B,) int32 -- legs run"
+             " before the shot held S (R if never), first_leg (B,) int32 -- leg of the first"
+             " converged solution (-1: none), weight (B,) float32 -- prior weight of the returned"
+             " solution (inf: none converged, OSD-0 answered), rival_weight (B,) float32 -- lowest"
+             " weight among converged solutions of a logical class other than the returned one's"
+             " (inf: none; needs obs at construction)).  rival_weight - weight is a complementary"
+             " gap the ensemble found without a second decode.");
 
     nb::class_<BpLsdDecoder>(m, "BpLsdDecoder")
         .def(nb::init<

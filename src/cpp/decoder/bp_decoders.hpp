@@ -40,6 +40,25 @@ struct BpResult {
     std::vector<uint8_t> converged;    // (B,)
 };
 
+// The observables as a sparse (row = observable, col = bit) list, so a kernel
+// can read a solution's logical class.  nnz == 0: no observables given.
+struct ObsTable {
+    Kokkos::View<int*, DeviceSpace> row;
+    Kokkos::View<int*, DeviceSpace> col;
+    int nnz = 0;
+};
+
+// Relay-BP's per-shot statistics, downloaded on request, in the paper's terms:
+// solutions -- converged solutions collected (at most S); legs -- legs run
+// before the shot held S (R if never); first_leg -- leg of the first converged
+// solution (-1: none); weight -- prior weight of the returned solution (+inf:
+// none converged, OSD-0 answered); rival_weight -- lowest weight among
+// converged solutions of another logical class (+inf: none, or no observables).
+struct RelayStats {
+    std::vector<int32_t> solutions, legs, first_leg;
+    std::vector<float>   weight, rival_weight;
+};
+
 struct BpWorkspace {
     int max_batch, nc, nb, E;
 
@@ -59,6 +78,14 @@ struct BpWorkspace {
     Kokkos::View<uint8_t**, DeviceSpace> best_pred;
     Kokkos::View<float*,    DeviceSpace> best_w;
     Kokkos::View<int*,      DeviceSpace> nconv;
+    // Relay-BP per-shot statistics: the logical class (observable bits) of the
+    // best solution, the lowest weight among converged solutions of any other
+    // class (the free complementary gap), the leg of the first converged
+    // solution (-1: none), and how many legs the shot ran before it held S.
+    Kokkos::View<uint32_t*, DeviceSpace> best_cls;
+    Kokkos::View<float*,    DeviceSpace> rival_w;
+    Kokkos::View<int*,      DeviceSpace> first_leg;
+    Kokkos::View<int*,      DeviceSpace> legs_done;
     // 32-bit (not uint8) so check_parity's atomic XOR uses native hardware
     // atomics; sub-word atomics fall back to CAS/lock emulation and serialize
     // badly on high-weight rows.
@@ -163,6 +190,9 @@ struct RelayConfig {
 // solutions and returns the one of lowest prior weight (Relay-BP-S); a shot
 // that never converges falls back to OSD-0.  converged reports whether any leg
 // converged.
+// With obs given, each converged solution's class is read so the lightest
+// solution of any other class is kept beside the best; with stats given, the
+// per-shot statistics are downloaded into it.  Neither changes the decode.
 BpResult relay_bp_decode_batch(
     const EdgeTable& et,
     const Kokkos::View<uint8_t**, DeviceSpace>& H_dev,
@@ -170,7 +200,9 @@ BpResult relay_bp_decode_batch(
     int B,
     const RelayConfig& cfg,
     BpWorkspace& ws,
-    OsdWorkspace& osd_ws);
+    OsdWorkspace& osd_ws,
+    const ObsTable* obs = nullptr,
+    RelayStats* stats = nullptr);
 
 // ─── BP + LSD  (bp_lsd.cpp) ──────────────────────────────────────────────────
 struct LsdConfig {
