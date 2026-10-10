@@ -12,6 +12,10 @@ void bp_run(const EdgeTable& et, int B, int max_iter, BpWorkspace& ws) {
     auto row    = et.edge_row;
     auto col    = et.edge_col;
     auto ch_llr = et.channel_llr;
+    auto rptr   = et.row_ptr;
+    auto redge  = et.row_edge;
+    auto cptr   = et.col_ptr;
+    auto cedge  = et.col_edge;
 
     auto pair_B = Kokkos::make_pair(0, B);
     auto syn_u   = Kokkos::subview(ws.syndrome_u, pair_B, Kokkos::ALL());
@@ -41,21 +45,26 @@ void bp_run(const EdgeTable& et, int B, int max_iter, BpWorkspace& ws) {
 
     Kokkos::DefaultExecutionSpace exec;
     for (int iter = 0; iter < max_iter; ++iter) {
-        Kokkos::deep_copy(exec, rs, 0.0f);
-        Kokkos::deep_copy(exec, sc, 0.0f);
-        Kokkos::parallel_for("row_scatter",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,E}),
-            KOKKOS_LAMBDA(int s, int e) {
+        // each check's sums over its edges in ascending edge order: a fixed order,
+        // so the same syndrome gives the same messages on every call
+        Kokkos::parallel_for("row_gather",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nc}),
+            KOKKOS_LAMBDA(int s, int r) {
                 if (conv(s)) return;
-                float tv = Kokkos::tanh(v2c(s,e) * 0.5f);
-                // Clamp magnitude away from both 0 and 1: away from 1 keeps atanh()
-                // finite downstream, away from 0 keeps log(|tv|) from hitting -inf
-                // (which otherwise cancels against itself in c2v_update's
-                // rs(row) - lt and produces NaN that poisons total_llr).
-                float mag = Kokkos::min(Kokkos::max(Kokkos::abs(tv), 1e-6f), 1.0f - BP_EPS);
-                tv = (tv < 0.0f) ? -mag : mag;
-                Kokkos::atomic_add(&rs(s, row(e)), Kokkos::log(mag));
-                if (tv < 0.0f) Kokkos::atomic_add(&sc(s, row(e)), 1.0f);
+                float acc = 0.0f, neg = 0.0f;
+                for (int k = rptr(r); k < rptr(r + 1); ++k) {
+                    const int e = redge(k);
+                    float tv = Kokkos::tanh(v2c(s,e) * 0.5f);
+                    // Clamp magnitude away from both 0 and 1: away from 1 keeps atanh()
+                    // finite downstream, away from 0 keeps log(|tv|) from hitting -inf
+                    // (which otherwise cancels against itself in the c2v update's
+                    // rs(row) - lt and produces NaN that poisons total_llr).
+                    float mag = Kokkos::min(Kokkos::max(Kokkos::abs(tv), 1e-6f), 1.0f - BP_EPS);
+                    acc += Kokkos::log(mag);
+                    if (tv < 0.0f) neg += 1.0f;
+                }
+                rs(s, r) = acc;
+                sc(s, r) = neg;
             });
 
         Kokkos::parallel_for("c2v_update",
@@ -75,12 +84,13 @@ void bp_run(const EdgeTable& et, int B, int max_iter, BpWorkspace& ws) {
                 c2v(s,e) = 2.0f * Kokkos::atanh(esign * ssign * extr_mag);
             });
 
-        Kokkos::deep_copy(exec, tlr, 0.0f);
-        Kokkos::parallel_for("col_scatter",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,E}),
-            KOKKOS_LAMBDA(int s, int e) {
+        Kokkos::parallel_for("col_gather",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
+            KOKKOS_LAMBDA(int s, int j) {
                 if (conv(s)) return;
-                Kokkos::atomic_add(&tlr(s, col(e)), c2v(s,e));
+                float acc = 0.0f;
+                for (int k = cptr(j); k < cptr(j + 1); ++k) acc += c2v(s, cedge(k));
+                tlr(s, j) = acc;
             });
         Kokkos::parallel_for("add_ch",
             Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),

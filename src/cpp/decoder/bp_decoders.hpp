@@ -27,6 +27,10 @@ struct EdgeTable {
     Kokkos::View<int*,   DeviceSpace> edge_row;
     Kokkos::View<int*,   DeviceSpace> edge_col;
     Kokkos::View<float*, DeviceSpace> channel_llr;
+    // each check's and each bit's edges in ascending edge order, so a sum over
+    // them runs in one fixed order and BP is the same on every call
+    Kokkos::View<int*,   DeviceSpace> row_ptr, row_edge;   // num_checks + 1, num_edges
+    Kokkos::View<int*,   DeviceSpace> col_ptr, col_edge;   // num_bits + 1,   num_edges
 
     static EdgeTable from_csc(
         int num_checks, int num_bits,

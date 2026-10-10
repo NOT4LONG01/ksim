@@ -247,8 +247,11 @@ leg for `RelayBpDecoder`) supplied the prediction.
   reference implementation's settings (`gamma0=0.1, R=301, Tr=60, S=5`) it
   lands on that implementation's LER (tetrahedral n=15, p=5e-3, 20 000 shots:
   4.5e-4 vs 4.0e-4), where `S=1` with a plain-BP first leg gives 1.25e-3.
-  The later legs' γ is keyed by a shot's place in its batch, so a shot's
-  prediction depends on how the shots were batched, not on `seed` alone.
+  The later legs' γ is keyed by the shot's own syndrome and `seed`, and BP's
+  sums over a check's or a bit's edges run in one fixed order (no float atomics),
+  so a shot's prediction depends on its syndrome alone -- not on its place in a
+  batch, the batch size or what was decoded before. Exact fixed-weight
+  enumeration relies on that.
   `decode_batch_with_stats` runs the same decode and adds, per shot and in the
   paper's terms: `solutions` (converged solutions collected, at most `S`),
   `legs` (legs run before the shot held `S`; `R` if never), `first_leg` (leg of

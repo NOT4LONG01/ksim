@@ -24,6 +24,20 @@ EdgeTable EdgeTable::from_csc(
     et.edge_row = Kokkos::create_mirror_view_and_copy(DeviceSpace{}, h_row);
     et.edge_col = Kokkos::create_mirror_view_and_copy(DeviceSpace{}, h_col);
 
+    auto adjacency = [&](int n, const Kokkos::View<int*, Kokkos::HostSpace>& of,
+                         Kokkos::View<int*, DeviceSpace>& ptr,
+                         Kokkos::View<int*, DeviceSpace>& edge) {
+        Kokkos::View<int*, Kokkos::HostSpace> h_ptr("h_ptr", n + 1), h_edge("h_edge", et.num_edges);
+        for (int e = 0; e < et.num_edges; ++e) h_ptr(of(e) + 1) += 1;
+        for (int i = 0; i < n; ++i) h_ptr(i + 1) += h_ptr(i);
+        std::vector<int> fill(n, 0);
+        for (int e = 0; e < et.num_edges; ++e) h_edge(h_ptr(of(e)) + fill[of(e)]++) = e;
+        ptr  = Kokkos::create_mirror_view_and_copy(DeviceSpace{}, h_ptr);
+        edge = Kokkos::create_mirror_view_and_copy(DeviceSpace{}, h_edge);
+    };
+    adjacency(num_checks, h_row, et.row_ptr, et.row_edge);
+    adjacency(num_bits,   h_col, et.col_ptr, et.col_edge);
+
     Kokkos::View<float*, Kokkos::HostSpace> h_llr("h_llr", num_bits);
     for (int j = 0; j < num_bits; ++j) {
         float p = std::max(BP_EPS, std::min(1.0f - BP_EPS, p_error[j]));
@@ -120,7 +134,7 @@ BpResult download_result(int B, int nb, BpWorkspace& ws) {
 // The order among tied posteriors decides the pivot set, and BP leaves many
 // exact ties on a non-converged shot (symmetric bits far from the syndrome).
 // Ties go to the likelier channel prior, then the lower column index; the
-// quantisation keeps that rule stable under float32 atomic summation noise.
+// quantisation keeps that rule stable against float32 rounding in the posteriors.
 KOKKOS_INLINE_FUNCTION bool osd_col_before(float ta, float la, int ia,
                                            float tb, float lb, int ib) {
     float qa = Kokkos::floor(ta / OSD_TIE_TOL);

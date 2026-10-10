@@ -22,6 +22,10 @@ void bp_run_memory(
     auto row    = et.edge_row;
     auto col    = et.edge_col;
     auto ch_llr = et.channel_llr;
+    auto rptr   = et.row_ptr;
+    auto redge  = et.row_edge;
+    auto cptr   = et.col_ptr;
+    auto cedge  = et.col_edge;
 
     auto pair_B = Kokkos::make_pair(0, B);
     auto syn_u   = Kokkos::subview(ws.syndrome_u, pair_B, Kokkos::ALL());
@@ -40,21 +44,26 @@ void bp_run_memory(
     Kokkos::DefaultExecutionSpace exec;
     for (int iter = 0; iter < max_iter; ++iter) {
         // c2v update — same as standard BP
-        Kokkos::deep_copy(exec, rs, 0.0f);
-        Kokkos::deep_copy(exec, sc, 0.0f);
-        Kokkos::parallel_for("mr_scatter",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,E}),
-            KOKKOS_LAMBDA(int s, int e) {
+        // each check's sums over its edges in ascending edge order: a fixed order,
+        // so the same syndrome gives the same messages on every call
+        Kokkos::parallel_for("mr_gather",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nc}),
+            KOKKOS_LAMBDA(int s, int r) {
                 if (conv(s)) return;
-                float tv = Kokkos::tanh(v2c(s,e) * 0.5f);
-                // Clamp magnitude away from both 0 and 1: away from 1 keeps atanh()
-                // finite downstream, away from 0 keeps log(|tv|) from hitting -inf
-                // (which otherwise cancels against itself in mc2v's rs(row) - lt
-                // and produces NaN that poisons total_llr).
-                float mag = Kokkos::min(Kokkos::max(Kokkos::abs(tv), 1e-6f), 1.0f - BP_EPS);
-                tv = (tv < 0.0f) ? -mag : mag;
-                Kokkos::atomic_add(&rs(s, row(e)), Kokkos::log(mag));
-                if (tv < 0.0f) Kokkos::atomic_add(&sc(s, row(e)), 1.0f);
+                float acc = 0.0f, neg = 0.0f;
+                for (int k = rptr(r); k < rptr(r + 1); ++k) {
+                    const int e = redge(k);
+                    float tv = Kokkos::tanh(v2c(s,e) * 0.5f);
+                    // Clamp magnitude away from both 0 and 1: away from 1 keeps atanh()
+                    // finite downstream, away from 0 keeps log(|tv|) from hitting -inf
+                    // (which otherwise cancels against itself in the c2v update's
+                    // rs(row) - lt and produces NaN that poisons total_llr).
+                    float mag = Kokkos::min(Kokkos::max(Kokkos::abs(tv), 1e-6f), 1.0f - BP_EPS);
+                    acc += Kokkos::log(mag);
+                    if (tv < 0.0f) neg += 1.0f;
+                }
+                rs(s, r) = acc;
+                sc(s, r) = neg;
             });
 
         Kokkos::parallel_for("mc2v",
@@ -75,12 +84,13 @@ void bp_run_memory(
             });
 
         // Variable update + memory v2c
-        Kokkos::deep_copy(exec, tlr, 0.0f);
-        Kokkos::parallel_for("mcol_scatter",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,E}),
-            KOKKOS_LAMBDA(int s, int e) {
+        Kokkos::parallel_for("mcol_gather",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{B,nb}),
+            KOKKOS_LAMBDA(int s, int j) {
                 if (conv(s)) return;
-                Kokkos::atomic_add(&tlr(s, col(e)), c2v(s,e));
+                float acc = 0.0f;
+                for (int k = cptr(j); k < cptr(j + 1); ++k) acc += c2v(s, cedge(k));
+                tlr(s, j) = acc;
             });
         // Posterior with memory-blended prior:
         //   tlr = (1-gamma)*lambda + gamma*tlr_old + sum_c c2v
@@ -134,7 +144,7 @@ void bp_run_memory(
 }
 
 // ─── Relay BP ─────────────────────────────────────────────────────────────────
-// splitmix64 — stateless hash for per-(leg,shot,variable) gamma draws
+// splitmix64 — stateless hash for per-(leg,syndrome,variable) gamma draws
 KOKKOS_INLINE_FUNCTION uint64_t splitmix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -259,6 +269,18 @@ BpResult relay_bp_decode_batch(
     const uint64_t seed = cfg.seed ^ 0xdeadbeefcafeULL;
     const float gmin = cfg.gamma_center - 0.5f * cfg.gamma_width, grange = cfg.gamma_width;
 
+    // each shot's key from its own syndrome, so its legs' memory strengths follow the
+    // syndrome and not where in a batch it sits
+    Kokkos::View<uint64_t*, DeviceSpace> shot_key("relay_shot_key", B);
+    auto syn_u = ws.syndrome_u;
+    const int nc = et.num_checks;
+    Kokkos::parallel_for("relay_shot_key", B, KOKKOS_LAMBDA(int s) {
+        uint64_t key = 0x243f6a8885a308d3ULL;
+        for (int r = 0; r < nc; ++r)
+            if (syn_u(s, r)) key = splitmix64(key ^ (uint64_t)(r + 1));
+        shot_key(s) = key;
+    });
+
     for (int leg = 1; leg < cfg.R; ++leg) {
         int active = 0;
         Kokkos::parallel_reduce("relay_active", B,
@@ -271,7 +293,7 @@ BpResult relay_bp_decode_batch(
             KOKKOS_LAMBDA(int s, int j) {
                 uint64_t h = splitmix64(
                     seed + (uint64_t)leg * 0x100000001b3ULL
-                         + (uint64_t)s   * 0x9e3779b97f4a7c15ULL
+                         + shot_key(s)   * 0x9e3779b97f4a7c15ULL
                          + (uint64_t)j);
                 float u = (float)(h >> 40) * (1.0f / 16777216.0f);
                 gam(s,j) = gmin + u * grange;
