@@ -44,7 +44,7 @@ import matplotlib.pyplot as plt
 
 COLOURS = {"xtim": "#1f77b4", "ksim": "#ff7f0e", "tsim": "#2ca02c",
            "clifft": "#d62728", "merlin": "#9467bd"}
-LABELS = {"xtim": "xtim (CPU, 1 core) [SDK2025]",
+LABELS = {"xtim": "xtim (CPU) [SDK2025]",
           "ksim": "ksim (GPU) [ours]",
           "tsim": "tsim (GPU, JAX) [HLZ2026]",
           "clifft": "clifft (CPU) [CL2026]",
