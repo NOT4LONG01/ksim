@@ -235,6 +235,32 @@ states, so it takes over as xtim's exponential build becomes infeasible and clif
 per-shot cost explodes. Where xtim can build and the shot budget is large, xtim is the faster
 sampler per shot. tsim, the other GPU stabilizer-rank engine, is dominated by ksim at every k.
 
+**Note: xtim's build can be fixed at source, so this benchmark favours ksim's design.**
+xtim (v2.7.0) is single-threaded, and so is its build. We checked whether changing its source
+would speed it up (2026-10-12):
+
+- **Where the time goes.** py-spy shows 94–99 % of the build at k ≥ 10 inside
+  `CanonicalStabSum::from_rays` (`cpp/src/canonical_stab_sum.cpp`), called from the
+  `TwirlSampler` constructor. That routine canonicalizes all χ = 2^k branch rays.
+- **Splitting into components.** Build each disjoint copy as its own sampler and concatenate the
+  detector records. That is ksim's per-component compile, done outside xtim.
+  - The build becomes linear: 0.012 s at k = 12 against 18.5 s stock, and 0.27 s at k = 128.
+  - It is exact in distribution: at k = 8 and 100 000 shots, all 528 single and pairwise
+    detector rates agree with stock xtim within 2.83σ.
+  - In a Python prototype, merging the samplers' outputs raises per-shot cost to 0.28–0.40
+    µs/shot; a C++ merge would remove most of that.
+- **OpenMP.** Three lines in the ray loops of `rebuild_from_rays` parallelise the build, with
+  output bit-identical to stock.
+  - Measured 1.99× on 2 threads; the estimate is 30–70× on 128 cores.
+  - The build stays exponential, so the 600 s limit moves only from k ≈ 16 to k ≈ 19.
+- **Caching.** Not available: with `disk_cache=True` xtim still rebuilds every time, and MPI
+  ranks would each rebuild too.
+
+Independent copies are the case splitting handles best. On this benchmark a split xtim would
+roughly match ksim's scaling, so the stock-xtim curves measure its single-block build, not a
+limit of its method. A fair test of ksim's advantage needs one connected circuit with the same
+χ, where neither splitting nor ksim's per-component compile applies.
+
 ### Theoretical ground
 
 **stim** rests on the Gottesman–Knill theorem: a state reachable from |0…0⟩
