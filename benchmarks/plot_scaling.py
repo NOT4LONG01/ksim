@@ -44,11 +44,19 @@ import matplotlib.pyplot as plt
 
 COLOURS = {"xtim": "#1f77b4", "ksim": "#ff7f0e", "tsim": "#2ca02c",
            "clifft": "#d62728", "merlin": "#9467bd"}
-LABELS = {"xtim": "xtim (CPU, 1 core) [arXiv:2512.23799]",
-          "ksim": "ksim (GPU) [this work]",
-          "tsim": "tsim (GPU, JAX) [QuEra, bloqade-tsim]",
-          "clifft": "clifft (CPU) [Unitary Fdn.]",
-          "merlin": "merlin (CPU) [pip merlin-sim]"}
+LABELS = {"xtim": "xtim (CPU, 1 core) [Surti2025]",
+          "ksim": "ksim (GPU) [ours]",
+          "tsim": "tsim (GPU, JAX) [Haenel2026]",
+          "clifft": "clifft (CPU) [Chase2026]",
+          "merlin": "merlin (CPU) [Cercelescu2026]"}
+# Surti2025       arXiv:2512.23799   Surti, Daguerre, Kim, "Efficient simulation of logical
+#                                    magic state preparation protocols"
+# Haenel2026      arXiv:2604.01059   Haenel, Luo, Zhao, "Tsim: Fast Universal Simulator for
+#                                    Quantum Error Correction"
+# Chase2026       arXiv:2604.27058   Chase, Labib, "Clifft: Fast Exact Simulation of
+#                                    Near-Clifford Quantum Circuits"
+# Cercelescu2026  arXiv:2610.06811   Cercelescu, Koch, Pesah, "Polynomial-time simulation of
+#                                    non-Clifford quantum error correction"
 SHOT_COUNTS = ((10**6, "-"), (10**8, ":"))
 WALL_SHOTS = 10**6
 POINT = dict(marker="o", ms=6, mec="black", mew=0.6, lw=1.5)
