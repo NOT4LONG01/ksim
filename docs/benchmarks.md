@@ -153,7 +153,7 @@ so the circuit carries k independent magic states (`benchmarks/bench_scaling.py`
   timed draws; tsim is timed at one fixed batch shape (4 096) so no XLA recompile lands in the timing.
 - **CPU (Xeon Gold 6548Y+):** xtim (single-threaded), clifft and merlin.
 
-Legend keys: [Surti2025] = xtim, [arXiv:2512.23799](https://arxiv.org/abs/2512.23799); [Haenel2026] = tsim, [arXiv:2604.01059](https://arxiv.org/abs/2604.01059); [Chase2026] = clifft, [arXiv:2604.27058](https://arxiv.org/abs/2604.27058); [Cercelescu2026] = merlin, [arXiv:2610.06811](https://arxiv.org/abs/2610.06811).
+Legend keys: [SDK2025] = xtim, [arXiv:2512.23799](https://arxiv.org/abs/2512.23799); [HLZ2026] = tsim, [arXiv:2604.01059](https://arxiv.org/abs/2604.01059); [CL2026] = clifft, [arXiv:2604.27058](https://arxiv.org/abs/2604.27058); [CKP2026] = merlin, [arXiv:2610.06811](https://arxiv.org/abs/2610.06811).
 
 Each point draws 100 000 shots. A build killed after 600 s drops that engine from every larger k.
 Each cell is setup / µs per shot:
