@@ -150,14 +150,14 @@ def warm(draw, shots, seconds, batch=None):
 def xtim_point(text, shots, seconds, q):
     import xtim
     t0 = time.perf_counter()
-    circuit = xtim.Circuit(text)
-    chi = circuit.compile_reference().chi
-    sampler = circuit.compile_detector_sampler(seed=7)
+    # The sampler builds what it needs itself; a separate compile_reference() would
+    # only add its own cost (χ = 2^k here by construction, so it is not measured).
+    sampler = xtim.Circuit(text).compile_detector_sampler(seed=7)
     sampler.sample(256)
     setup = time.perf_counter() - t0
     us, n, dets = warm(lambda m: np.asarray(sampler.sample(m, separate_observables=True)[0]),
                        shots, seconds)
-    q.put({"chi": chi, "setup_s": setup, "us_per_shot": us, "shots": n,
+    q.put({"setup_s": setup, "us_per_shot": us, "shots": n,
            "rates": dets.mean(axis=0).tolist()})
 
 
