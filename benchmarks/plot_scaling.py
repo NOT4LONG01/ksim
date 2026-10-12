@@ -117,7 +117,7 @@ def main(argv=None):
         ks = killed(rows, e)
         if ks:
             ax.plot(ks, [y] * len(ks), ls="none", marker="^", ms=9, mfc="white",
-                    mec=COLOURS[e], mew=1.6, label=f"{e} killed at {limit:.0f} s")
+                    mec=COLOURS[e], mew=1.6)
 
     fig, ax = frame(f"One-time cost ({head})", XLABEL, "seconds")
     for e in engines:
@@ -180,8 +180,7 @@ def main(argv=None):
         for e in engines:
             if e in row and row[e] is None:
                 ax.plot([limit], [min(u for _, u, _ in pts)], ls="none", marker=">", ms=9,
-                        mfc="white", mec=COLOURS[e], mew=1.6,
-                        label=f"{e}: setup > {limit:.0f} s (killed)")
+                        mfc="white", mec=COLOURS[e], mew=1.6)
         save(fig, ax, out / f"scaling_pareto_k{k}.png")
     return 0
 
