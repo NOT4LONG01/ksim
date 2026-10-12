@@ -41,6 +41,22 @@ within 2.5σ across all six of its protocol circuits.
 <a name="part-1"></a>
 ## Part 1 — Non-Clifford simulation deep dive: stim → tsim → kokkos_sim → clifft → xtim
 
+**At a glance.**
+- **Per shot:** xtim wins on every circuit inside its class (generalized T-depth 1), by
+  up to 230×; on two circuits the engines tie. It is single-threaded, and its per-shot cost stays flat in the number of
+  independent magic states.
+- **Scaling:** kokkos_sim scales where xtim, clifft and tsim do not ([scaling](#scaling)).
+  - Over k independent magic states, its setup stays at 0.3–0.5 s and its per-shot cost grows
+    linearly (0.03 → 1.0 µs/shot from k = 1 to 16).
+  - xtim compiles a reference of χ = 2^k, growing ~×2.5 per state, and stops finishing in 10 min
+    at k = 15. clifft's per-shot cost doubles per state (713 µs/shot at k = 16).
+  - kokkos_sim is on the setup/per-shot Pareto front at every k; tsim and merlin never are.
+  - It is the fastest end to end from k = 8 at 10^6 shots and from k = 12 at 10^8.
+  - It also samples circuits outside xtim's class (T-depth ≥ 2), which xtim refuses.
+- **tsim** runs the same stabilizer-rank sum as kokkos_sim, ~25–350× slower and with a 10–14 s
+  JIT per circuit shape.
+- **stim** stays the Clifford reference.
+
 ### Five-sampler comparison
 
 All five samplers compared here, by algorithm and measured properties:
@@ -121,8 +137,98 @@ Decision guide — which sampler to use:
 | Magic-state prep inside generalized T-depth 1 | xtim | χ = 2^{folded rank}, T-count free; exact per-shot ⟨P⟩ |
 | Non-Clifford, small peak_rank (k ≤ ~8) | clifft | 2^k ≤ 256 amplitudes, no GPU needed |
 | Non-Clifford, many T-gates (t ≥ 15) | kokkos_sim | χ ≈ 2^{0.228t} beats 2^k at scale; GPU |
+| Many independent magic states (k ≳ 8 at 10^6 shots, k ≳ 12 at 10^8, any k ≥ 15) | kokkos_sim | cost linear in k; xtim's reference compile grows ~2.5× per state and clifft's per-shot cost ×2 per state ([scaling](#scaling)) |
 | T-depth ≥ 2 after folding (xtim refuses) | kokkos_sim | stabilizer-rank has no structural restriction on the T layer |
 | Rare-event LER (no millions of shots) | clifft | `sample_k()` importance sampling — unique |
+
+<a name="scaling"></a>
+### Scaling with independent magic states
+
+The table above compares one circuit at a time. To see how each engine scales, take xtim's own
+`miniature_oracle` (one magic state, χ = 2) and place k copies side by side on disjoint qubits,
+so the circuit carries k independent magic states (`benchmarks/bench_scaling.py`, figures by
+`benchmarks/plot_scaling.py`). Five engines, each on its native substrate:
+
+- **GPU (H100 NVL):** ksim (kokkos_sim) and tsim (JAX/XLA). Measured on an idle card, fastest of 3
+  timed draws; tsim is timed at one fixed batch shape (4 096) so no XLA recompile lands in the timing.
+- **CPU (Xeon Gold 6548Y+):** xtim (single-threaded), clifft and merlin.
+
+Each point draws 100 000 shots. A build killed after 600 s drops that engine from every larger k.
+Each cell is setup / µs per shot:
+
+| k | qubits | xtim (χ = 2^k) | ksim | tsim | clifft | merlin |
+|---|---|---|---|---|---|---|
+| 1 | 5 | 0.004 s / 0.050 | 0.33 s / **0.030** | 4.7 s / 0.90 | 0.001 s / 0.064 | 0.002 s / 5.0 |
+| 2 | 10 | 0.007 s / **0.048** | 0.29 s / 0.067 | 8.1 s / 1.12 | 0.002 s / 0.17 | 0.006 s / 13.7 |
+| 4 | 20 | 0.025 s / **0.039** | 0.33 s / 0.14 | 14.3 s / 1.55 | 0.002 s / 0.53 | 0.019 s / 44 |
+| 6 | 30 | 0.14 s / **0.050** | 0.35 s / 0.24 | 20.3 s / 2.23 | 0.002 s / 1.47 | 0.036 s / 92 |
+| 8 | 40 | 0.96 s / **0.059** | 0.39 s / 0.36 | 26.0 s / 2.89 | 0.003 s / 2.8 | 0.067 s / 180 |
+| 10 | 50 | 7.4 s / **0.055** | 0.42 s / 0.49 | 32.4 s / 3.68 | 0.005 s / 8.6 | 0.089 s / 275 |
+| 12 | 60 | 67 s / **0.061** | 0.46 s / 0.61 | 38.0 s / 4.00 | 0.014 s / 40 | 0.12 s / 394 |
+| 13 | 65 | 164 s / **0.059** | 0.46 s / 0.68 | 41.0 s / 4.24 | 0.027 s / 83 | 0.14 s / 467 |
+| 14 | 70 | 400 s / **0.060** | 0.49 s / 0.75 | 44.1 s / 4.31 | 0.048 s / 168 | 0.16 s / 538 |
+| 15 | 75 | > 600 s (killed) | 0.50 s / **0.82** | 46.7 s / 4.70 | 0.091 s / 334 | 0.18 s / 627 |
+| 16 | 80 | not run | 0.53 s / **1.02** | 49.4 s / 4.92 | 0.20 s / 713 | 0.22 s / 714 |
+
+Detector fire rates of xtim, tsim and clifft agree with ksim within 3.0σ at every k. merlin returns
+raw measurements rather than detectors, so it is timed only.
+
+![One-time cost against k](../example/figure/scaling_setup.png)
+
+**Setup.** xtim pays χ once, at build time. Its folded π/8 layer has rank k, so its reference
+state has χ = 2^k, and compiling it grows ~×2.5 per added magic state: from milliseconds at
+k ≤ 4 to 400 s at k = 14. It did not finish within 10 min at k = 15.
+- ksim compiles each disconnected component on its own, so its setup stays at 0.3–0.5 s
+  across the whole range. It crosses below xtim at k ≈ 7.
+- tsim's XLA compile grows linearly, from 5 s to 49 s.
+- clifft and merlin build in milliseconds.
+
+![Per-shot cost against k](../example/figure/scaling_per_shot.png)
+
+**Per shot.**
+- **xtim** holds 0.04–0.06 µs/shot at every k it can build, because its twirl engine does not
+  pay χ per shot.
+- **ksim** grows linearly, ~0.066 µs/shot per copy, from 0.030 to 1.02 µs/shot. It beats xtim at
+  k = 1, and is 12× slower at k = 14.
+- **clifft** doubles per magic state (2^k active amplitudes). It is slower than ksim per shot
+  from k = 1 (0.064 against 0.030), and reaches 713 µs/shot at k = 16.
+- **tsim** runs the same stabilizer-rank sum as ksim, 5–30× slower per shot and 14–93× slower
+  to set up.
+- **merlin** is the slowest at every k (tied with clifft at k = 16).
+
+![Wall time for N shots against k](../example/figure/scaling_total.png)
+
+![Wall time for 10^6 shots against k](../example/figure/scaling_wall_1e6.png)
+
+**End to end, setup included:**
+- **N = 10^6 shots:** ksim is the fastest engine from k = 8 on (0.75 s against 1.0 s for xtim;
+  1.2 s against 400 s at k = 14).
+- **N = 10^8 shots:** xtim's per-shot lead outweighs its build through k = 10. ksim is the
+  fastest from k = 12 (62 s against 73 s), and at k = 14 it takes 76 s against 406 s.
+- **k ≥ 15:** xtim produces no samples. At k = 16 and N = 10^8, ksim takes 102 s, tsim 540 s and
+  clifft ~20 h.
+
+**The Pareto front.** At a fixed k, each engine is a point in the (setup, µs/shot) plane. The
+front is the set of engines that no other engine beats on both setup and µs/shot.
+
+![Pareto front at k = 1](../example/figure/scaling_pareto_k1.png)
+![Pareto front at k = 8](../example/figure/scaling_pareto_k8.png)
+![Pareto front at k = 14](../example/figure/scaling_pareto_k14.png)
+![Pareto front at k = 16](../example/figure/scaling_pareto_k16.png)
+
+| k | on the front (setup ascending) | dominated |
+|---|---|---|
+| 1 | clifft, xtim, ksim | merlin, tsim |
+| 8 | clifft, ksim, xtim | merlin, tsim |
+| 14 | clifft, ksim, xtim | merlin, tsim |
+| 16 | clifft, ksim | merlin, tsim (xtim killed) |
+
+**The claim this supports is scaling.** ksim and clifft are the only engines on the front at
+every k. clifft is there only because its millisecond setup is the cheapest, while its per-shot
+cost grows ×2 per state. ksim's setup is flat and its per-shot cost is linear in the number of independent magic
+states, so it takes over as xtim's exponential build becomes infeasible and clifft's exponential
+per-shot cost explodes. Where xtim can build and the shot budget is large, xtim is the faster
+sampler per shot. tsim, the other GPU stabilizer-rank engine, is dominated by ksim at every k.
 
 ### Theoretical ground
 
@@ -411,9 +517,9 @@ direct consequence of that choice.
 |---|---|---|---|---|
 | **stim** | Aaronson–Gottesman tableau | nothing (polynomial) | Clifford memory: 0.17–0.87 µs/shot, unbeatable | any T gate — a T conjugates a Pauli out of the group |
 | **tsim** | ZX stabilizer-rank, complex64 on XLA | T-count, χ ≈ 2^{0.228t} | nothing in this comparison | reach kokkos_sim's precision (2.7e-8 vs 1.1e-16) or amortize its 9.5–14.1 s JIT per circuit shape |
-| **kokkos_sim** | ZX stabilizer-rank, int64 ℤ[ω] on CUDA | T-count, χ ≈ 2^{0.228t} | encoded non-Clifford at batch scale: 85q distillation at ~1.6 µs/shot, ~350× faster than tsim | survive a large T-count — d=5 cultivation (11 T-gates) exhausted 24 GB of compile without emitting a program |
+| **kokkos_sim** | ZX stabilizer-rank, int64 ℤ[ω] on CUDA | T-count, χ ≈ 2^{0.228t} | encoded non-Clifford at batch scale: 85q distillation at ~1.6 µs/shot, ~350× faster than tsim | survive a large T-count — d=5 cultivation (11 T-gates) exhausted 24 GB of compile without emitting a program. Scales linearly in independent magic states: 16 copies set up in 2.7 s |
 | **clifft** | factored statevector over the active subspace | active dimension k, 2^k | small non-Clifford, low peak_rank: 0.27 µs/shot on the logical 5q distillation; the only importance sampler (`sample_k()`) | hold up as k grows — the 85q encoded circuit is est. 100–10 000 µs/shot |
-| **xtim** | one folded π/8 layer + exact reference state | folded magic rank, χ = 2^{rank} | magic-state preparation: 0.03–4.8 µs/shot regardless of T-count; the only exact per-shot ⟨P⟩ | anything outside generalized T-depth 1 — a single H between two T gates is a hard refusal |
+| **xtim** | one folded π/8 layer + exact reference state | folded magic rank, χ = 2^{rank} | magic-state preparation: 0.03–4.8 µs/shot regardless of T-count; the only exact per-shot ⟨P⟩ | anything outside generalized T-depth 1 — a single H between two T gates is a hard refusal; many independent magic states — the reference compile grows ~2.5× per state, > 10 min at 15 |
 
 Read as a decision, that is four regimes. Clifford work belongs to stim, and
 nothing else comes close. Magic-state *preparation*
